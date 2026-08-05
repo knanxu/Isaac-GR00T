@@ -1,22 +1,26 @@
 from __future__ import annotations
 
+import json
 import random
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
-
-import numpy as np
-import pytest
-import torch
 
 from gr00t.eval.real_robot.TOPPRA.eval_toppra_bimanual import (
     BimanualToppraRolloutConfig,
     CartesianLimits,
 )
+from gr00t.eval.real_robot.TOPPRA.kion_client.client import KionTopics
 from gr00t.eval.real_robot.TOPPRA.speed_rl import client as speed_rl_client
 from gr00t.eval.real_robot.TOPPRA.speed_rl.agent import SpeedRLAgent, speed_planner_configs
 from gr00t.eval.real_robot.TOPPRA.speed_rl.baseline import verify_frozen_baseline
-from gr00t.eval.real_robot.TOPPRA.speed_rl.client import _parse_args, _validate_runtime_args
+from gr00t.eval.real_robot.TOPPRA.speed_rl.client import (
+    EpisodeState,
+    SpeedRLKionClient,
+    _parse_args,
+    _validate_runtime_args,
+)
 from gr00t.eval.real_robot.TOPPRA.speed_rl.config import RainbowConfig
 from gr00t.eval.real_robot.TOPPRA.speed_rl.contract import (
     FeatureContract,
@@ -30,7 +34,11 @@ from gr00t.eval.real_robot.TOPPRA.speed_rl.network import (
     project_categorical_distribution,
     select_masked_action,
 )
-from gr00t.eval.real_robot.TOPPRA.speed_rl.phases import CalibrationManager, EpisodeOutcome
+from gr00t.eval.real_robot.TOPPRA.speed_rl.phases import (
+    CalibrationManager,
+    EpisodeOutcome,
+    GreedyAcceptance,
+)
 from gr00t.eval.real_robot.TOPPRA.speed_rl.probe_server import build_kion_probe_observation
 from gr00t.eval.real_robot.TOPPRA.speed_rl.replay import (
     PrioritizedReplayBuffer,
@@ -38,6 +46,9 @@ from gr00t.eval.real_robot.TOPPRA.speed_rl.replay import (
     build_n_step_transitions,
 )
 from gr00t.eval.real_robot.TOPPRA.speed_rl.safety import SpeedViolationMonitor
+import numpy as np
+import pytest
+import torch
 
 
 FEATURE_DIM = 8
@@ -263,6 +274,15 @@ def test_calibration_requires_two_valid_episodes_and_explicit_approval(tmp_path)
     assert calibration.state.stopped
     with pytest.raises(RuntimeError, match="stopped"):
         _ = calibration.fixed_action
+
+
+def test_greedy_acceptance_persists_across_restarts(tmp_path) -> None:
+    state_path = tmp_path / "greedy_sync.json"
+    acceptance = GreedyAcceptance(state_path=state_path)
+    acceptance.add(EpisodeOutcome(success=True, duration_s=20.0))
+    restored = GreedyAcceptance(state_path=state_path)
+    assert len(restored.outcomes) == 1
+    assert restored.outcomes[0].safe_success
 
 
 def test_async_runtime_gate_requires_raw_and_speed_rl_greedy_verification(tmp_path) -> None:
@@ -506,12 +526,168 @@ def test_fake_server_latency_keeps_act_below_control_budget(delay_s: float) -> N
         assert agent.diagnostics()["speed_rl_activated_decisions"] == 1
         transitions = agent.finish_episode(EpisodeOutcome(success=True))
         assert len(transitions) == 1
+        records = agent.last_episode_decisions()
+        assert len(records) == 1
+        assert "feature" not in records[0]
+        assert records[0]["sequence_id"] == agent.diagnostics()["active_sequence_id"]
         assert any(
             transitions[0].reward == pytest.approx(expected)
             for expected in (0.7**2, 1.0, 1.3**2, 1.6**2)
         )
     finally:
         agent.teardown()
+
+
+def test_greedy_client_persists_labeled_episode_without_mutating_replay(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeObservations:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeResource:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.closed = False
+
+        def wait_for_connection(self, _timeout: float) -> None:
+            return None
+
+        def configure(self, _timeout: float) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeRecorder(FakeResource):
+        def __init__(self, directory, _metadata) -> None:
+            super().__init__()
+            self.directory = directory
+            self.directory.mkdir(parents=True)
+            self.csv_path = self.directory / "tcp_tracking.csv"
+            self.csv_path.touch()
+
+    class FakeLearner:
+        def __init__(self) -> None:
+            self.add_calls = 0
+            self.save_calls = 0
+            self.snapshot = {
+                "replay_size": 320,
+                "action_counts": (80, 80, 80, 80),
+                "policy_version": 7,
+                "update_count": 22,
+                "activated_decisions": 320,
+                "online_training_ready": True,
+                "beta": 0.6,
+            }
+
+        def stats(self) -> dict[str, Any]:
+            return dict(self.snapshot)
+
+        def install_actor_weights(self, actor: Any) -> int:
+            actor.policy_version = self.snapshot["policy_version"]
+            return actor.policy_version
+
+        def add_episode(self, _transitions: Any) -> int:
+            self.add_calls += 1
+            return 1
+
+        def save(self, _path: Any) -> dict[str, Any]:
+            self.save_calls += 1
+            return self.stats()
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(inference_mode="sync")
+            self.feature_contract = CONTRACT
+            self.fixed_action = None
+            self.greedy = False
+            self.action_mask = None
+            self.closed = False
+
+        def reset_execution(self) -> None:
+            return None
+
+        def set_fixed_action(self, value: int | None) -> None:
+            self.fixed_action = value
+
+        def set_greedy(self, value: bool) -> None:
+            self.greedy = value
+
+        def set_action_mask(self, value: Any) -> None:
+            self.action_mask = tuple(value)
+
+        def finish_episode(self, _outcome: EpisodeOutcome) -> list[Transition]:
+            return [_transition(0, reward=1.0, done=True)]
+
+        def last_episode_decisions(self) -> list[dict[str, Any]]:
+            return [{"sequence_id": 1, "action_index": 0, "speed_scale": 0.7}]
+
+        def diagnostics(self) -> dict[str, Any]:
+            return {
+                "speed_rl_activated_decisions": 320,
+                "speed_rl_policy_version": 7,
+            }
+
+        def teardown(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(speed_rl_client, "RolloutObservationBuffer", FakeObservations)
+    monkeypatch.setattr(speed_rl_client, "KionDualArmServo", FakeResource)
+    monkeypatch.setattr(speed_rl_client, "KionPinchExecutor", FakeResource)
+    monkeypatch.setattr(speed_rl_client, "TrackingRecorder", FakeRecorder)
+
+    calibration = CalibrationManager(tmp_path / "state" / "calibration.json")
+    calibration.state.complete = True
+    calibration.state.speed_index = 3
+    learner = FakeLearner()
+    agent = FakeAgent()
+    actor = SimpleNamespace(policy_version=0)
+    client = SpeedRLKionClient(
+        ros_types=SimpleNamespace(rospy=object(), hand_namespace="fake.hand.msg"),
+        topics=KionTopics(),
+        agent=agent,
+        actor=actor,
+        learner=learner,
+        safety=SpeedViolationMonitor(np.ones(6), np.ones(6)),
+        calibration=calibration,
+        phase="greedy",
+        checkpoint_path=tmp_path / "speed_rl.pt",
+        log_root=tmp_path / "episodes",
+        control_frequency=250,
+        servo_gain=800,
+        startup_timeout_s=1,
+        max_state_age_s=1,
+        max_image_age_s=1,
+        task="parcel",
+        dry_run=True,
+    )
+    client._online_budget.completed_episodes = 22
+    client._twist_stale = False
+    client._start_episode()
+    assert client.state is EpisodeState.RUNNING
+    assert agent.greedy
+    assert agent.action_mask == (True, True, True, True)
+    episode_directory = client.recorder.directory
+    client._finish_episode(success=True, reason="operator success")
+    client._finalizer.join(timeout=2)
+
+    assert learner.add_calls == 0
+    assert learner.save_calls == 0
+    outcome = json.loads((episode_directory / "outcome.json").read_text())
+    assert outcome["finalization_complete"] is True
+    assert outcome["safe_success"] is True
+    assert outcome["decisions"][0]["sequence_id"] == 1
+    assert (
+        GreedyAcceptance(state_path=tmp_path / "state" / "greedy_sync_acceptance.json").result()[
+            "episodes"
+        ]
+        == 1
+    )
+    client.close()
 
 
 def test_reset_execution_invalidates_late_policy_result() -> None:

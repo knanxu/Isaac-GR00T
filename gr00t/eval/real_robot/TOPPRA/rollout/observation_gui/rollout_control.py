@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 from queue import Empty, Full, Queue
 import threading
 import time
 from typing import Any
 
+from controlloop import Mode
 import dearpygui.dearpygui as dpg
+from gui.module import GUIModule
 import rospy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-
-from gui.module import GUIModule
 
 
 class RolloutControlPanel(GUIModule):
@@ -40,6 +39,10 @@ class RolloutControlPanel(GUIModule):
         self._last_result = "Waiting for rollout status"
         self._commands: Queue[str] = Queue(maxsize=8)
         self._shutdown = threading.Event()
+        self._control_loop = None
+        self._control_state = None
+        self._recording_episode: int | None = None
+        self._saved_episode: int | None = None
         self._subscriber = rospy.Subscriber(
             f"{self.namespace}/status",
             String,
@@ -52,6 +55,12 @@ class RolloutControlPanel(GUIModule):
             name="RolloutGUICommands",
         )
         self._worker.start()
+
+    def bind(self, gui: Any) -> None:
+        """Attach the passive ObservationGUILite recorder without granting motion control."""
+
+        self._control_loop = gui.control_loop
+        self._control_state = gui.ctrl_state
 
     def _status_callback(self, message: String) -> None:
         try:
@@ -126,6 +135,7 @@ class RolloutControlPanel(GUIModule):
         dpg.add_text("Trajectory: ---", tag="rollout_trajectory_text")
         dpg.add_text("Speed-RL: ---", tag="rollout_speed_text")
         dpg.add_text("Safety: ---", tag="rollout_safety_text")
+        dpg.add_text("Dataset: idle", tag="rollout_dataset_text")
         dpg.add_text(self._last_result, tag="rollout_command_text", wrap=1800)
 
     @staticmethod
@@ -141,6 +151,7 @@ class RolloutControlPanel(GUIModule):
             status = dict(self._status)
             age_s = time.monotonic() - self._last_status_s if self._last_status_s else None
         state = str(status.get("state", "connecting"))
+        self._sync_passive_recording(status)
         running = state == "running"
         finalizing = bool(status.get("finalization_in_progress", False))
         mode = status.get("mode", "---")
@@ -165,24 +176,48 @@ class RolloutControlPanel(GUIModule):
         )
         dpg.set_value(
             "rollout_speed_text",
-            "Speed-RL: phase={} | action={} | scale={} | policy={}".format(
+            "Speed-RL: phase={} | action={} | scale={} | policy={} | epsilon={} | "
+            "replay={} | per-speed={} | updates={}".format(
                 phase or "disabled",
                 self._fmt(status.get("speed_action")),
                 self._fmt(status.get("speed_scale")),
                 self._fmt(status.get("policy_version")),
+                self._fmt(status.get("epsilon")),
+                self._fmt(status.get("replay_size")),
+                status.get("replay_action_counts", "---"),
+                self._fmt(status.get("learner_update_count")),
             ),
         )
         dpg.set_value(
             "rollout_safety_text",
-            "Safety: violation={} | twist_stale={} | mask={} | outcome={}".format(
+            "Safety: violation={} | twist_stale={} | critical_stale={} | mask={} | "
+            "outcome={} | safe_success={}".format(
                 status.get("speed_violation", False),
                 status.get("twist_stale", "---"),
+                status.get("critical_stale_fields", "---"),
                 status.get("action_mask", "---"),
                 status.get("last_outcome", "---"),
+                status.get("last_safe_success", "---"),
             ),
         )
+        recording_mode = (
+            "unbound" if self._control_state is None else self._control_state.get_mode().name
+        )
+        frame_count = 0 if self._control_state is None else self._control_state.frame_count
+        dpg.set_value(
+            "rollout_dataset_text",
+            f"Dataset: mode={recording_mode} | frames={frame_count} | "
+            f"recording_episode={self._recording_episode or '---'} | "
+            f"last_saved_episode={self._saved_episode or '---'}",
+        )
         dpg.set_value("rollout_command_text", self._last_result)
-        dpg.configure_item("rollout_start", enabled=not running and not finalizing)
+        start_blocked = bool(status.get("critical_stale_fields")) or bool(
+            status.get("finalization_error")
+        )
+        dpg.configure_item(
+            "rollout_start",
+            enabled=not running and not finalizing and not start_blocked,
+        )
         dpg.configure_item("rollout_success", enabled=running)
         dpg.configure_item("rollout_failure", enabled=running)
         dpg.configure_item("rollout_abort", enabled=running)
@@ -192,6 +227,54 @@ class RolloutControlPanel(GUIModule):
             enabled=mode == "speed-rl" and awaiting_approval and not running,
         )
 
+    def _sync_passive_recording(self, status: dict[str, Any]) -> None:
+        if self._control_loop is None or self._control_state is None:
+            return
+        try:
+            episode = int(status.get("episode", 0))
+        except (TypeError, ValueError):
+            return
+        state = str(status.get("state", ""))
+        if state == "running" and episode > 0 and episode != self._recording_episode:
+            if self._control_loop.frames:
+                self._control_loop.discard_episode()
+            self._control_state.task = str(status.get("task", ""))
+            self._control_state.episode_success = False
+            self._control_state.set_mode(Mode.RECORDING)
+            self._recording_episode = episode
+            self._last_result = f"Recording external rollout episode {episode}"
+            return
+        if self._recording_episode != episode or state not in {"terminated", "aborted"}:
+            return
 
-def configured_namespace() -> str:
-    return os.environ.get("GR00T_ROLLOUT_NAMESPACE", "/gr00t_rollout")
+        outcome = status.get("last_outcome")
+        if state == "terminated" and outcome not in {"success", "failure"}:
+            return
+        self._control_state.set_mode(Mode.REVIEWING)
+        if state == "aborted":
+            self._control_loop.discard_episode()
+            self._last_result = f"Discarded aborted rollout episode {episode}"
+        else:
+            frame_index = max(len(self._control_loop.frames) - 2, 0)
+            self._control_loop.debug_events.append(
+                {
+                    "frame_index": frame_index,
+                    "events": [
+                        {
+                            "type": "external_rollout_outcome",
+                            "episode": episode,
+                            "outcome": outcome,
+                            "safe_success": bool(status.get("last_safe_success", False)),
+                            "speed_violation": bool(status.get("speed_violation", False)),
+                            "tracking_log": status.get("tracking_log"),
+                        }
+                    ],
+                }
+            )
+            self._control_state.episode_success = bool(
+                outcome == "success" and status.get("last_safe_success", True)
+            )
+            self._control_loop.save_episode()
+            self._saved_episode = episode
+            self._last_result = f"Saved rollout episode {episode} with label {outcome}"
+        self._recording_episode = None

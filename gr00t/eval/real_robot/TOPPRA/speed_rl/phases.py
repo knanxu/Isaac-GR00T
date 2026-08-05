@@ -160,11 +160,42 @@ class OnlineEpisodeBudget:
 @dataclass
 class GreedyAcceptance:
     outcomes: list[EpisodeOutcome] = field(default_factory=list)
+    state_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path = Path(self.state_path)
+        if not self.state_path.exists():
+            return
+        raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        stored = raw.get("outcomes") if isinstance(raw, dict) else None
+        if not isinstance(stored, list):
+            raise ValueError("Greedy acceptance checkpoint is invalid")
+        self.outcomes = [EpisodeOutcome(**item) for item in stored]
+        if len(self.outcomes) > 5:
+            raise ValueError("Greedy acceptance checkpoint contains more than five episodes")
 
     def add(self, outcome: EpisodeOutcome) -> None:
         if len(self.outcomes) >= 5:
             raise RuntimeError("Five greedy acceptance episodes are already recorded")
         self.outcomes.append(outcome)
+        self._save()
+
+    def _save(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(
+                {"outcomes": [asdict(outcome) for outcome in self.outcomes]},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(self.state_path)
 
     def result(self) -> dict[str, Any]:
         successes = [outcome for outcome in self.outcomes if outcome.safe_success]

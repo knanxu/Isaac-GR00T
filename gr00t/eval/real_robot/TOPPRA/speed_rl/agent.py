@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 import logging
 import threading
+import time
 from typing import Any, Sequence
 
 import numpy as np
@@ -125,12 +126,16 @@ class _SpeedPlannerRouter:
             if context.episode_epoch == self.agent._episode_epoch:
                 self.agent.trajectory_decisions[trajectory.sequence_id] = {
                     "sequence_id": trajectory.sequence_id,
+                    "request_generation": context.request_generation,
                     "feature": feature.copy(),
                     "action_index": action_index,
                     "speed_scale": SPEED_SCALES[action_index],
                     "action_mask": action_mask.copy(),
                     "policy_version": self.agent.speed_actor.policy_version,
                     "episode_epoch": context.episode_epoch,
+                    "tts_candidate_index": candidate_index,
+                    "trajectory_duration_s": float(trajectory.duration),
+                    "used_toppra": bool(trajectory.used_toppra),
                 }
                 assert context.planned_sequences is not None
                 context.planned_sequences.append(trajectory.sequence_id)
@@ -189,6 +194,8 @@ class SpeedRLAgent(GR00TAgent):
         self._greedy = bool(greedy)
         self.trajectory_decisions: dict[int, dict[str, Any]] = {}
         self._activation_events: list[dict[str, Any]] = []
+        self._finished_episode_decisions: list[dict[str, Any]] = []
+        self._discarded_decision_count = 0
         super().__init__(*args, **kwargs)
         self.config = replace(
             self.config,
@@ -234,17 +241,21 @@ class SpeedRLAgent(GR00TAgent):
                     request.generation != self._request_generation
                     or context.episode_epoch != self._episode_epoch
                 ):
-                    self.trajectory_decisions.pop(
+                    discarded = self.trajectory_decisions.pop(
                         ready.trajectory.sequence_id,
                         None,
                     )
+                    if discarded is not None:
+                        self._discarded_decision_count += 1
             return ready
         except BaseException:
             context = self._feature_context
             if context is not None:
                 with self._cv:
                     for sequence_id in context.planned_sequences or ():
-                        self.trajectory_decisions.pop(sequence_id, None)
+                        discarded = self.trajectory_decisions.pop(sequence_id, None)
+                        if discarded is not None:
+                            self._discarded_decision_count += 1
             raise
         finally:
             self._feature_local.context = None
@@ -293,16 +304,22 @@ class SpeedRLAgent(GR00TAgent):
         if activated:
             decision = self.trajectory_decisions.pop(sequence_id, None)
             if decision is not None and int(decision["episode_epoch"]) == self._episode_epoch:
+                decision["activation_index"] = len(self._activation_events)
+                decision["activated_monotonic_s"] = time.monotonic()
                 self._activation_events.append(decision)
                 self._activated_decision_count += 1
         elif self._ready_trajectory is None:
-            self.trajectory_decisions.pop(sequence_id, None)
+            discarded = self.trajectory_decisions.pop(sequence_id, None)
+            if discarded is not None:
+                self._discarded_decision_count += 1
         return activated
 
     def finish_episode(self, outcome: EpisodeOutcome) -> list[Transition]:
         with self._cv:
             events = list(self._activation_events)
             self._activation_events.clear()
+            self._finished_episode_decisions.clear()
+            self._discarded_decision_count += len(self.trajectory_decisions)
             self.trajectory_decisions.clear()
             self._episode_epoch += 1
             self._request_generation += 1
@@ -314,6 +331,7 @@ class SpeedRLAgent(GR00TAgent):
         if not events:
             return []
         transitions: list[Transition] = []
+        decision_records: list[dict[str, Any]] = []
         for index, event in enumerate(events):
             terminal = index == len(events) - 1
             next_event = events[index] if terminal else events[index + 1]
@@ -332,15 +350,40 @@ class SpeedRLAgent(GR00TAgent):
                     ).copy(),
                 )
             )
+            feature = np.asarray(event["feature"], dtype=np.float32)
+            decision_records.append(
+                {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"feature", "action_mask"}
+                }
+                | {
+                    "action_mask": np.asarray(event["action_mask"], dtype=np.bool_).tolist(),
+                    "feature_mean": float(np.mean(feature)),
+                    "feature_std": float(np.std(feature)),
+                    "feature_l2_norm": float(np.linalg.norm(feature)),
+                    "reward": reward,
+                    "terminal": terminal,
+                    "safe_success": outcome.safe_success,
+                }
+            )
+        with self._cv:
+            self._finished_episode_decisions = decision_records
         return transitions
+
+    def last_episode_decisions(self) -> list[dict[str, Any]]:
+        with self._cv:
+            return [dict(item) for item in self._finished_episode_decisions]
 
     def reset_execution(self) -> None:
         """Start a new epoch and invalidate producer results from the previous episode."""
 
         with self._cv:
             self._episode_epoch += 1
+            self._discarded_decision_count += len(self.trajectory_decisions)
             self.trajectory_decisions.clear()
             self._activation_events.clear()
+            self._finished_episode_decisions.clear()
             self._request_generation += 1
             self._completed_generation = self._request_generation
             self._pending_request = None
@@ -412,6 +455,7 @@ class SpeedRLAgent(GR00TAgent):
                 "speed_rl_policy_version": self.speed_actor.policy_version,
                 "speed_rl_activated_decisions": self._activated_decision_count,
                 "speed_rl_pending_decisions": len(self.trajectory_decisions),
+                "speed_rl_discarded_decisions": self._discarded_decision_count,
                 "speed_rl_active_action_index": (
                     None if active_decision is None else active_decision["action_index"]
                 ),

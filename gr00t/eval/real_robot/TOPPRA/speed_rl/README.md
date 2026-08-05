@@ -51,10 +51,13 @@ feature、候选数、horizon、dtype 和契约：
 .venv/bin/python -m gr00t.eval.real_robot.TOPPRA.speed_rl.probe_server \
   --server-host 127.0.0.1 \
   --server-port 47866 \
+  --requests 10 \
+  --warmup-requests 2 \
   --task "move parcel onto conveyor belt one by one"
 ```
 
-成功时输出 JSON 且 `status` 为 `ok`。旧 server 即使能返回 action，因为没有
+成功时输出 JSON 且 `status` 为 `ok`，同时报告端到端 median/P95/max 以及 action/feature
+payload 字节数。旧 server 即使能返回 action，因为没有
 `get_speed_rl_contract` endpoint，也会被明确拒绝；这表示必须在云端拉取本提交并重启。
 
 ### 3. 笔记本配置 ROS/Kion 环境
@@ -99,7 +102,7 @@ python -m gr00t.eval.real_robot.TOPPRA.speed_rl \
   --right-twist-thresholds VX,VY,VZ,WX,WY,WZ
 ```
 
-原始、无 RL 的实机 rollout 入口保持不变：
+原始、无 RL 的实机 rollout 入口保持不变；新实验建议统一从 `../rollout/` 启动：
 
 ```bash
 python -m gr00t.eval.real_robot.TOPPRA.kion_client \
@@ -131,6 +134,14 @@ GUI 按钮和终端命令具有相同语义：
 `min(2 * 新增 transition 数, 256)` 次更新，actor 只在下一次 `start` 安装，因此 episode
 中权重冻结。最后使用 `PHASE=greedy` 运行五个验收 episode。
 
+只有真正被 TOPPRA 激活执行的 speed decision 才会成为 transition。候选规划失败、错过异步
+handoff、episode epoch 已变化或从未激活的轨迹只计入 discarded decision。每个 episode 的
+`outcome.json` 保存 action、mask、policy version、feature 统计量和最终奖励，但不保存完整
+feature。完整 feature 只存在于 replay checkpoint。
+
+Greedy 验收必须等 22 个在线 episode 全部完成，使用冻结 checkpoint 且 `epsilon=0`。验收
+episode 不写 replay、不更新网络、也不覆盖训练 checkpoint；同步与异步验收计数分别持久化。
+
 状态、replay、checkpoint 和 episode 日志默认持久化到：
 
 ```text
@@ -139,7 +150,9 @@ logs/kion_speed_rl/episodes/
 ```
 
 不要删除 state 目录，否则标定批准、训练计数和 replay 会丢失。checkpoint 会严格校验 server
-feature 契约，避免把旧模型训练出的速度 head 静默用于新模型。
+feature 契约，避免把旧模型训练出的速度 head 静默用于新模型。每个 episode 的
+`outcome.json` 使用原子替换写入；如果 replay、checkpoint 或 phase state 最终化失败，status
+会显示 `finalization_error` 并阻止同一进程继续 start。
 
 ## 安全与异步门槛
 
@@ -168,5 +181,5 @@ python -c \
 ```
 
 测试覆盖 C51、PER、3-step、mask、checkpoint、99/100 帧违例、feature/action 裁剪对齐、
-100/300 ms 假 server 延迟和 `act()` 控制预算。`task_time` shaping、实际阈值以及硬件认证上限
-仍必须由实机流程确认，代码不会自行推断。
+100/300 ms 假 server 延迟、greedy 不污染 replay、episode 持久化和 `act()` 控制预算。
+`task_time` shaping、实际阈值以及硬件认证上限仍必须由实机流程确认，代码不会自行推断。

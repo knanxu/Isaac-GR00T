@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from enum import Enum, auto
+import importlib.util
 import json
-from types import SimpleNamespace
+from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
-
-import numpy as np
 
 from gr00t.eval.real_robot.TOPPRA.kion_client.client import KionTopics
 from gr00t.eval.real_robot.TOPPRA.rollout import plain_client as plain_module
+from gr00t.eval.real_robot.TOPPRA.rollout.observation import (
+    CRITICAL_ROLLOUT_KEYS,
+    LOCAL_TWIST_KEYS,
+    RolloutObservationBuffer,
+    policy_observation,
+    rollout_staleness,
+)
 from gr00t.eval.real_robot.TOPPRA.rollout.operator import RosEpisodeBridge, status_json
 from gr00t.eval.real_robot.TOPPRA.rollout.pinch import (
     LEFT_HIGH,
@@ -18,6 +27,7 @@ from gr00t.eval.real_robot.TOPPRA.rollout.pinch import (
 )
 from gr00t.eval.real_robot.TOPPRA.rollout.plain_client import _parse_args as parse_plain_args
 from gr00t.eval.real_robot.TOPPRA.speed_rl.client import _parse_args as parse_speed_args
+import numpy as np
 
 
 class _TriggerResponse:
@@ -142,6 +152,120 @@ def test_unified_clients_default_to_sync_single_candidate_gui_control() -> None:
         assert args.tts_samples == 1
         assert args.control_interface == "gui"
         assert args.ros_namespace == "/gr00t_rollout"
+        assert args.server_port == 47866
+
+
+def test_rollout_observation_contract_ignores_pressure_and_omits_stale_twist() -> None:
+    assert all("finger_pressure" not in key for key in RolloutObservationBuffer.REQUIRED_KEYS)
+    critical_key = next(iter(CRITICAL_ROLLOUT_KEYS))
+    critical, twist_stale = rollout_staleness((critical_key, LOCAL_TWIST_KEYS[0]))
+    assert critical == (critical_key,)
+    assert twist_stale
+
+    observation = {
+        key: np.zeros(1, dtype=np.float32) for key in RolloutObservationBuffer.REQUIRED_KEYS
+    }
+    observation["observation.state.left_finger_pressure"] = np.ones(6, dtype=np.float32)
+    selected = policy_observation(observation, twist_stale=True)
+    assert not any(key in selected for key in LOCAL_TWIST_KEYS)
+    assert "observation.state.left_finger_pressure" not in selected
+
+
+def test_observation_gui_passively_saves_labels_and_discards_abort(monkeypatch) -> None:
+    class Mode(Enum):
+        IDLE = auto()
+        RECORDING = auto()
+        REVIEWING = auto()
+
+    dearpygui_package = ModuleType("dearpygui")
+    dearpygui_module = ModuleType("dearpygui.dearpygui")
+    dearpygui_package.dearpygui = dearpygui_module
+    gui_package = ModuleType("gui")
+    gui_module = ModuleType("gui.module")
+    gui_module.GUIModule = object
+    gui_package.module = gui_module
+    controlloop = ModuleType("controlloop")
+    controlloop.Mode = Mode
+    std_msgs = ModuleType("std_msgs.msg")
+    std_msgs.String = object
+    std_srvs = ModuleType("std_srvs.srv")
+    std_srvs.Trigger = object
+    for name, module in {
+        "dearpygui": dearpygui_package,
+        "dearpygui.dearpygui": dearpygui_module,
+        "gui": gui_package,
+        "gui.module": gui_module,
+        "controlloop": controlloop,
+        "rospy": ModuleType("rospy"),
+        "std_msgs.msg": std_msgs,
+        "std_srvs.srv": std_srvs,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    source = (
+        Path(__file__).parents[3]
+        / "gr00t/eval/real_robot/TOPPRA/rollout/observation_gui/rollout_control.py"
+    )
+    spec = importlib.util.spec_from_file_location("test_rollout_control_overlay", source)
+    assert spec is not None and spec.loader is not None
+    overlay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay)
+
+    class FakeState:
+        def __init__(self) -> None:
+            self.mode = Mode.IDLE
+            self.task = ""
+            self.episode_success = False
+
+        def set_mode(self, mode: Mode) -> None:
+            self.mode = mode
+
+    class FakeLoop:
+        def __init__(self) -> None:
+            self.frames: list[dict[str, Any]] = []
+            self.debug_events: list[dict[str, Any]] = []
+            self.saved: list[tuple[bool, list[dict[str, Any]]]] = []
+            self.discarded = 0
+
+        def save_episode(self) -> None:
+            self.saved.append((state.episode_success, list(self.debug_events)))
+            self.frames.clear()
+            self.debug_events.clear()
+
+        def discard_episode(self) -> None:
+            self.discarded += 1
+            self.frames.clear()
+
+    state = FakeState()
+    loop = FakeLoop()
+    panel = overlay.RolloutControlPanel.__new__(overlay.RolloutControlPanel)
+    panel._control_loop = loop
+    panel._control_state = state
+    panel._recording_episode = None
+    panel._saved_episode = None
+    panel._last_result = ""
+
+    panel._sync_passive_recording({"state": "running", "episode": 3, "task": "parcel"})
+    assert state.mode is Mode.RECORDING
+    assert state.task == "parcel"
+    loop.frames.extend([{}, {}, {}])
+    panel._sync_passive_recording(
+        {
+            "state": "terminated",
+            "episode": 3,
+            "last_outcome": "success",
+            "last_safe_success": True,
+            "speed_violation": False,
+            "tracking_log": "tracking.csv",
+        }
+    )
+    assert panel._saved_episode == 3
+    assert loop.saved[0][0] is True
+    assert loop.saved[0][1][0]["events"][0]["outcome"] == "success"
+
+    panel._sync_passive_recording({"state": "running", "episode": 4, "task": "parcel"})
+    panel._sync_passive_recording({"state": "aborted", "episode": 4, "last_outcome": "abort"})
+    assert loop.discarded == 1
 
 
 def test_plain_episode_lifecycle_recreates_agent_and_persists_operator_outcome(
@@ -195,7 +319,7 @@ def test_plain_episode_lifecycle_recreates_agent_and_persists_operator_outcome(
         def teardown(self) -> None:
             self.closed = True
 
-    monkeypatch.setattr(plain_module, "KionObservationBuffer", FakeObservations)
+    monkeypatch.setattr(plain_module, "RolloutObservationBuffer", FakeObservations)
     monkeypatch.setattr(plain_module, "KionDualArmServo", FakeServo)
     monkeypatch.setattr(plain_module, "KionPinchExecutor", FakePinch)
     monkeypatch.setattr(plain_module, "TrackingRecorder", FakeRecorder)

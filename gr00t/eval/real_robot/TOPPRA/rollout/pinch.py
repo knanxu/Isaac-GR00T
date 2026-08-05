@@ -29,9 +29,10 @@ def pinch_posture(
     if value.shape != (1,) or np.any(~np.isfinite(value)):
         raise ValueError("pinch action must be one finite scalar")
     amount = float(np.clip(value[0], 0.0, 1.0))
-    return np.asarray(low, dtype=np.float64) + (
-        np.asarray(high, dtype=np.float64) - np.asarray(low, dtype=np.float64)
-    ) * amount
+    return (
+        np.asarray(low, dtype=np.float64)
+        + (np.asarray(high, dtype=np.float64) - np.asarray(low, dtype=np.float64)) * amount
+    )
 
 
 class _HandWorker:
@@ -55,6 +56,8 @@ class _HandWorker:
         self.service_name = f"/zj_humanoid/hand/joint_switch/{side}"
         self._queue: Queue[NDArray[Any] | object] = Queue(maxsize=1)
         self._proxy = None
+        self._error_lock = threading.Lock()
+        self._error: BaseException | None = None
         if not self.dry_run:
             self._proxy = rospy.ServiceProxy(self.service_name, service_type, persistent=True)
         self._thread = threading.Thread(
@@ -90,8 +93,17 @@ class _HandWorker:
                 assert self._proxy is not None
                 self._proxy(posture)
                 last_call_s = time.monotonic()
-            except Exception:
+            except Exception as exc:
+                with self._error_lock:
+                    if self._error is None:
+                        self._error = exc
                 LOGGER.exception("%s pinch service call failed", self.side)
+
+    def raise_if_failed(self) -> None:
+        with self._error_lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(f"{self.side} pinch worker failed") from error
 
     def close(self) -> None:
         try:
@@ -144,6 +156,7 @@ class KionPinchExecutor:
         }
 
     def publish(self, left: NDArray[Any], right: NDArray[Any]) -> None:
+        self.raise_if_failed()
         for side, value in (("left", left), ("right", right)):
             normalized = np.asarray(value, dtype=np.float64).reshape(-1)
             if normalized.shape != (1,) or np.any(~np.isfinite(normalized)):
@@ -153,6 +166,10 @@ class KionPinchExecutor:
                 continue
             self._last[side] = normalized.copy()
             self._workers[side].submit(normalized)
+
+    def raise_if_failed(self) -> None:
+        for worker in self._workers.values():
+            worker.raise_if_failed()
 
     def close(self) -> None:
         errors = []

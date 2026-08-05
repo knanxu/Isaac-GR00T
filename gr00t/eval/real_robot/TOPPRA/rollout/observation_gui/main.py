@@ -1,14 +1,14 @@
+# ruff: noqa: E402
 import warnings
+
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 warnings.filterwarnings("ignore", message="Gym has been unmaintained")
 
-import rospy
-
 from agents.lerobuffer import LeroBuffer
 from agents.rollout_passive import PassiveRolloutAgent
 from gui import ObservationGUI
-from gui.rollout_control import RolloutControlPanel, configured_namespace
+from gui.rollout_control import RolloutControlPanel
 from observations import (
     LeftDeltaTCP,
     LeftFingerPressure,
@@ -23,6 +23,7 @@ from observations import (
     RightTCP,
     RightWristForce,
 )
+import rospy
 
 
 def main() -> None:
@@ -32,10 +33,6 @@ def main() -> None:
             ParcelCamera(
                 "head",
                 "/zj_humanoid/sensor/realsense_head/color/image_raw/compressed",
-            ),
-            ParcelCamera(
-                "chest",
-                "/zj_humanoid/sensor/realsense_up/color/image_raw/compressed",
             ),
             ParcelCamera(
                 "left",
@@ -64,7 +61,7 @@ def main() -> None:
         fps=30,
     )
     agent = PassiveRolloutAgent()
-    rollout_panel = RolloutControlPanel(configured_namespace())
+    rollout_panel = RolloutControlPanel("/gr00t_rollout")
     gui = ObservationGUI(
         controller,
         buffer,
@@ -73,6 +70,7 @@ def main() -> None:
         default_task="move parcel onto conveyor belt one by one",
         modules=[rollout_panel],
     )
+    rollout_panel.bind(gui)
     gui.run()
 
 

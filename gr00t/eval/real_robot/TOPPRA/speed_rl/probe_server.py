@@ -74,7 +74,11 @@ def probe_server(
     task: str,
     tts_samples: int,
     image_size: int,
+    requests: int = 1,
+    warmup_requests: int = 0,
 ) -> dict[str, Any]:
+    if requests < 1 or warmup_requests < 0:
+        raise ValueError("requests must be positive and warmup_requests must be nonnegative")
     contract = discover_server_contract(host, port, timeout_ms)
     client = GR00TPolicyClient(host, port, timeout_ms=timeout_ms)
     try:
@@ -87,12 +91,19 @@ def probe_server(
             batch_size=tts_samples,
             image_size=image_size,
         )
-        started = time.perf_counter()
-        response = client.get_action(observation)
-        latency_s = time.perf_counter() - started
+        response = None
+        latencies_ms: list[float] = []
+        for index in range(warmup_requests + requests):
+            started = time.perf_counter()
+            response = client.get_action(observation)
+            latency_ms = (time.perf_counter() - started) * 1_000.0
+            if index >= warmup_requests:
+                latencies_ms.append(latency_ms)
     finally:
         client.close()
 
+    if response is None:
+        raise RuntimeError("Server probe did not execute an inference request")
     actions = response[0]
     if not isinstance(actions, Mapping) or not actions:
         raise ValueError("Server returned an empty or invalid action mapping")
@@ -110,9 +121,22 @@ def probe_server(
         contract,
         [horizon] * candidate_count,
     )
+    action_bytes = sum(np.asarray(value).nbytes for value in actions.values())
+    feature_bytes = sum(np.asarray(value).nbytes for value in features)
     return {
         "server": f"{host}:{port}",
-        "latency_ms": round(latency_s * 1000.0, 3),
+        "latency_ms": round(float(np.median(latencies_ms)), 3),
+        "latency": {
+            "requests": requests,
+            "warmup_requests": warmup_requests,
+            "median_ms": round(float(np.median(latencies_ms)), 3),
+            "p95_ms": round(float(np.percentile(latencies_ms, 95)), 3),
+            "max_ms": round(float(np.max(latencies_ms)), 3),
+        },
+        "payload_bytes": {
+            "actions": action_bytes,
+            "speed_rl_features": feature_bytes,
+        },
         "contract": contract.to_dict(),
         "action_shapes": {key: list(shape) for key, shape in action_shapes.items()},
         "feature_shapes": [list(feature.shape) for feature in features],
@@ -129,10 +153,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=30_000)
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--tts-samples", type=int, default=1)
-    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--requests", type=int, default=1)
+    parser.add_argument("--warmup-requests", type=int, default=0)
     args = parser.parse_args(argv)
-    if args.tts_samples < 1 or args.image_size < 1 or args.timeout_ms < 1:
-        parser.error("tts-samples, image-size, and timeout-ms must be positive")
+    if (
+        args.tts_samples < 1
+        or args.image_size < 1
+        or args.timeout_ms < 1
+        or args.requests < 1
+        or args.warmup_requests < 0
+    ):
+        parser.error(
+            "tts-samples, image-size, timeout-ms, and requests must be positive; "
+            "warmup-requests must be nonnegative"
+        )
     return args
 
 
@@ -145,6 +180,8 @@ def main(argv: list[str] | None = None) -> None:
         task=args.task,
         tts_samples=args.tts_samples,
         image_size=args.image_size,
+        requests=args.requests,
+        warmup_requests=args.warmup_requests,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

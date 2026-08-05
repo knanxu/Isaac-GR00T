@@ -24,16 +24,16 @@ from ..kion_client.client import (
     RIGHT_TARGET_KEY,
     RIGHT_TWIST_KEY,
     KionDualArmServo,
-    KionObservationBuffer,
     KionTopics,
     RosTypes,
     load_ros_types,
 )
 from ..kion_client.tracking import TrackingRecorder, make_tracking_row
+from ..rollout.observation import RolloutObservationBuffer, policy_observation, rollout_staleness
 from ..rollout.operator import RosEpisodeBridge
 from ..rollout.pinch import KionPinchExecutor
 from .agent import SpeedRLAgent
-from .config import RainbowConfig
+from .config import RainbowConfig, epsilon_for_decisions
 from .contract import FeatureContract
 from .learner import LearnerProcess, SpeedActor
 from .phases import CalibrationManager, EpisodeOutcome, GreedyAcceptance, OnlineEpisodeBudget
@@ -107,7 +107,6 @@ class SpeedRLKionClient:
         self.ros_namespace = ros_namespace
         self.pinch_enabled = bool(pinch_enabled)
         self.pinch_max_rate_hz = float(pinch_max_rate_hz)
-        self.observations = KionObservationBuffer(ros_types, topics)
         self.servo: KionDualArmServo | None = None
         self.pinch: KionPinchExecutor | None = None
         self.recorder: TrackingRecorder | None = None
@@ -123,13 +122,25 @@ class SpeedRLKionClient:
         self._finalizer: threading.Thread | None = None
         self._finalization_error: str | None = None
         self._last_outcome: str | None = None
+        self._last_safe_success: bool | None = None
         self._tracking_log: str | None = None
         self._last_command_error: str | None = None
+        self._stale_fields: tuple[str, ...] = ()
+        self._critical_stale_fields: tuple[str, ...] = ()
+        self._twist_stale = True
+        self._learner_stats_lock = threading.Lock()
+        self._learner_stats = self.learner.stats()
         self._online_budget = OnlineEpisodeBudget(
             22,
             calibration.state_path.parent / "online_budget.json",
         )
-        self._greedy_acceptance = GreedyAcceptance()
+        self._greedy_acceptance = GreedyAcceptance(
+            state_path=(
+                calibration.state_path.parent
+                / f"greedy_{self.agent.config.inference_mode}_acceptance.json"
+            )
+        )
+        self.observations = RolloutObservationBuffer(ros_types, topics)
 
     def run(self) -> None:
         try:
@@ -164,16 +175,19 @@ class SpeedRLKionClient:
                 max_state_age_s=self.max_state_age_s,
                 max_image_age_s=self.max_image_age_s,
             )
-            twist_stale = LEFT_TWIST_KEY in snapshot.stale_fields or RIGHT_TWIST_KEY in (
-                snapshot.stale_fields
-            )
-            safety_status = self.safety.update(
-                snapshot.left_twist,
-                snapshot.right_twist,
-                stale=twist_stale,
-            )
-            self.agent.set_action_mask(safety_status.action_mask)
+            critical_stale, twist_stale = rollout_staleness(snapshot.stale_fields)
+            self._stale_fields = snapshot.stale_fields
+            self._critical_stale_fields = critical_stale
+            self._twist_stale = twist_stale
             self._drain_commands()
+
+            if self.state == EpisodeState.RUNNING:
+                safety_status = self.safety.update(
+                    snapshot.left_twist,
+                    snapshot.right_twist,
+                    stale=twist_stale,
+                )
+                self.agent.set_action_mask(safety_status.action_mask)
 
             if (
                 self.state == EpisodeState.RUNNING
@@ -190,11 +204,19 @@ class SpeedRLKionClient:
                 "active_buffer_size": 0,
             }
             if self.state == EpisodeState.RUNNING:
-                if snapshot.stale_fields:
+                if self.pinch is not None:
+                    self.pinch.raise_if_failed()
+                if critical_stale:
                     target_left, target_right = self._hold_target(snapshot)
-                    diagnostics["execution_state"] = "state_stale_hold"
+                    diagnostics["execution_state"] = "critical_observation_stale_hold"
                 else:
-                    action = self.agent.act(snapshot.observation, self.task)
+                    action = self.agent.act(
+                        policy_observation(
+                            snapshot.observation,
+                            twist_stale=twist_stale,
+                        ),
+                        self.task,
+                    )
                     target_left = np.asarray(action[LEFT_TARGET_KEY], dtype=np.float64)
                     target_right = np.asarray(action[RIGHT_TARGET_KEY], dtype=np.float64)
                     self._last_target = {
@@ -356,6 +378,11 @@ class SpeedRLKionClient:
             raise RuntimeError(
                 f"The previous episode failed to finalize: {self._finalization_error}"
             )
+        if self._critical_stale_fields:
+            raise RuntimeError(
+                "Cannot start while required rollout observations are stale: "
+                + ", ".join(self._critical_stale_fields)
+            )
         if self.phase == "calibration":
             if self.calibration.state.complete:
                 raise RuntimeError(
@@ -368,12 +395,20 @@ class SpeedRLKionClient:
             if not self.calibration.state.complete:
                 raise RuntimeError("All four manually approved calibration speeds are required")
             stats = self.learner.stats()
+            self._cache_learner_stats(stats)
             if not stats["online_training_ready"]:
                 raise RuntimeError("Online replay gate requires 256 transitions and 32 per speed")
             if self._online_budget.remaining <= 0:
                 raise RuntimeError("The 22-episode online training budget is exhausted")
-        if self.phase == "greedy" and len(self._greedy_acceptance.outcomes) >= 5:
-            raise RuntimeError("The five-episode greedy acceptance run is complete")
+        if self.phase == "greedy":
+            if not self.calibration.state.complete:
+                raise RuntimeError("Greedy acceptance requires completed speed calibration")
+            if self._online_budget.remaining != 0:
+                raise RuntimeError("Greedy acceptance requires all 22 online-training episodes")
+            if len(self._greedy_acceptance.outcomes) >= 5:
+                raise RuntimeError("The five-episode greedy acceptance run is complete")
+        if fixed_action is not None and fixed_action >= 2 and self._twist_stale:
+            raise RuntimeError("Cannot calibrate speed 1.3/1.6 while measured TCP twist is stale")
 
         self._close_episode_resources()
         self.learner.install_actor_weights(self.actor)
@@ -381,44 +416,65 @@ class SpeedRLKionClient:
         self.agent.set_fixed_action(fixed_action)
         self.agent.set_greedy(self.phase == "greedy")
         self.safety.reset_episode()
-        self.agent.set_action_mask(self.safety.status().action_mask)
-        self.servo = KionDualArmServo(
-            self.ros_types,
-            self.topics,
-            control_frequency=self.control_frequency,
-            gain=self.servo_gain,
-            dry_run=self.dry_run,
+        initial_mask = (True, True, False, False) if self._twist_stale else (True,) * 4
+        self.agent.set_action_mask(initial_mask)
+
+        servo: KionDualArmServo | None = None
+        pinch: KionPinchExecutor | None = None
+        recorder: TrackingRecorder | None = None
+        next_episode = self.episode_number + 1
+        run_directory = self.log_root / (
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_episode_{next_episode:03d}"
         )
-        self.servo.wait_for_connection(self.startup_timeout_s)
-        self.servo.configure(self.startup_timeout_s)
-        if self.pinch_enabled:
-            self.pinch = KionPinchExecutor(
-                self.rospy,
-                self.ros_types.hand_namespace,
-                max_rate_hz=self.pinch_max_rate_hz,
+        try:
+            servo = KionDualArmServo(
+                self.ros_types,
+                self.topics,
+                control_frequency=self.control_frequency,
+                gain=self.servo_gain,
                 dry_run=self.dry_run,
             )
-        self.episode_number += 1
-        run_directory = self.log_root / (
-            datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_episode_{self.episode_number:03d}"
-        )
-        self.recorder = TrackingRecorder(
-            run_directory,
-            {
-                "episode": self.episode_number,
-                "phase": self.phase,
-                "task": self.task,
-                "policy_version": self.actor.policy_version,
-                "fixed_action": fixed_action,
-                "control_frequency": self.control_frequency,
-                "speed_rl_contract": self.agent.feature_contract.to_dict(),
-                "topics": asdict(self.topics),
-            },
-        )
-        self._tracking_log = str(self.recorder.csv_path)
+            servo.wait_for_connection(self.startup_timeout_s)
+            servo.configure(self.startup_timeout_s)
+            if self.pinch_enabled:
+                pinch = KionPinchExecutor(
+                    self.rospy,
+                    self.ros_types.hand_namespace,
+                    max_rate_hz=self.pinch_max_rate_hz,
+                    dry_run=self.dry_run,
+                )
+            recorder = TrackingRecorder(
+                run_directory,
+                {
+                    "episode": next_episode,
+                    "phase": self.phase,
+                    "inference_mode": self.agent.config.inference_mode,
+                    "task": self.task,
+                    "policy_version": self.actor.policy_version,
+                    "fixed_action": fixed_action,
+                    "control_frequency": self.control_frequency,
+                    "speed_rl_contract": self.agent.feature_contract.to_dict(),
+                    "topics": asdict(self.topics),
+                },
+            )
+        except BaseException:
+            for resource in (recorder, pinch, servo):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception:
+                        LOGGER.exception("Failed to clean up a partial Speed-RL start")
+            raise
+
+        self.servo = servo
+        self.pinch = pinch
+        self.recorder = recorder
+        self.episode_number = next_episode
+        self._tracking_log = str(recorder.csv_path)
         self._sample_index = 0
         self._last_target = None
         self._last_outcome = None
+        self._last_safe_success = None
         self._episode_started_s = time.monotonic()
         self.state = EpisodeState.RUNNING
         LOGGER.info(
@@ -449,13 +505,16 @@ class SpeedRLKionClient:
             duration_s=duration_s,
         )
         transitions = self.agent.finish_episode(outcome)
+        decisions = self.agent.last_episode_decisions()
         recorder = self.recorder
         self.recorder = None
         self.state = EpisodeState.TERMINATED
         self._last_outcome = "success" if success else "failure"
+        self._last_safe_success = outcome.safe_success
         self._schedule_finalization(
             outcome,
             transitions,
+            decisions,
             recorder,
             reason=reason,
         )
@@ -473,6 +532,7 @@ class SpeedRLKionClient:
             duration_s=duration_s,
         )
         transitions = self.agent.finish_episode(outcome)
+        decisions = self.agent.last_episode_decisions()
         recorder = self.recorder
         self.recorder = None
         if self.servo is not None:
@@ -483,6 +543,7 @@ class SpeedRLKionClient:
             self.pinch = None
         self.state = EpisodeState.ABORTED
         self._last_outcome = "abort"
+        self._last_safe_success = False
         LOGGER.warning(
             "Aborted episode=%d; servo is closed and replay finalization is asynchronous",
             self.episode_number,
@@ -490,6 +551,7 @@ class SpeedRLKionClient:
         self._schedule_finalization(
             outcome,
             transitions,
+            decisions,
             recorder,
             reason="operator abort",
         )
@@ -498,6 +560,7 @@ class SpeedRLKionClient:
         self,
         outcome: EpisodeOutcome,
         transitions: list[Transition],
+        decisions: list[dict[str, Any]],
         recorder: TrackingRecorder | None,
         *,
         reason: str,
@@ -506,23 +569,81 @@ class SpeedRLKionClient:
             raise RuntimeError("Another episode finalizer is already running")
         self._finalization_error = None
 
+        episode_number = self.episode_number
+        episode_directory = None if recorder is None else recorder.directory
+
+        def write_episode_record(payload: dict[str, Any]) -> None:
+            if episode_directory is None:
+                return
+            path = episode_directory / "outcome.json"
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+
         def finalize() -> None:
+            record: dict[str, Any] = {
+                **asdict(outcome),
+                "episode": episode_number,
+                "phase": self.phase,
+                "inference_mode": self.agent.config.inference_mode,
+                "operator_reason": reason,
+                "safe_success": outcome.safe_success,
+                "transition_count": len(transitions),
+                "phase_progressed": False,
+                "decisions": decisions,
+                "finalization_complete": False,
+            }
             try:
                 if recorder is not None:
                     recorder.close()
-                self.learner.add_episode(transitions)
+                write_episode_record(record)
+                with self._learner_stats_lock:
+                    record["learner_before"] = dict(self._learner_stats)
                 if self.phase == "calibration":
+                    if transitions:
+                        self.learner.add_episode(transitions)
+                        checkpoint_stats = self.learner.save(self.checkpoint_path)
+                    else:
+                        checkpoint_stats = self.learner.stats()
                     self.calibration.record_episode(outcome, len(transitions))
+                    record["phase_progressed"] = bool(transitions and outcome.valid_for_calibration)
                 elif self.phase == "online":
-                    self._online_budget.record()
-                    self.learner.train(
-                        min(2 * len(transitions), 256),
-                        require_online_gate=True,
-                    )
+                    if transitions:
+                        self.learner.add_episode(transitions)
+                        record["training"] = self.learner.train(
+                            min(2 * len(transitions), 256),
+                            require_online_gate=True,
+                        )
+                        checkpoint_stats = self.learner.save(self.checkpoint_path)
+                        self._online_budget.record()
+                        record["phase_progressed"] = True
+                    else:
+                        checkpoint_stats = self.learner.stats()
+                        record["training"] = {"updates": 0, "mean_loss": None}
+                        LOGGER.warning(
+                            "Online episode=%d had no activated decision and did not consume "
+                            "the 22-episode budget",
+                            episode_number,
+                        )
                 else:
-                    self._greedy_acceptance.add(outcome)
+                    if transitions:
+                        self._greedy_acceptance.add(outcome)
+                        record["phase_progressed"] = True
+                    else:
+                        LOGGER.warning(
+                            "Greedy episode=%d had no activated decision and was not counted",
+                            episode_number,
+                        )
+                    checkpoint_stats = self.learner.stats()
                     LOGGER.info("Greedy acceptance: %s", self._greedy_acceptance.result())
-                self.learner.save(self.checkpoint_path)
+                self._cache_learner_stats(checkpoint_stats)
+                record["learner_after"] = checkpoint_stats
+                record["greedy_acceptance"] = self._greedy_acceptance.result()
+                record["finalization_complete"] = True
+                write_episode_record(record)
                 LOGGER.info(
                     "Finalized episode=%d result=%s transitions=%d speed_violation=%s reason=%s",
                     self.episode_number,
@@ -533,6 +654,11 @@ class SpeedRLKionClient:
                 )
             except BaseException as exc:
                 self._finalization_error = f"{type(exc).__name__}: {exc}"
+                record["finalization_error"] = self._finalization_error
+                try:
+                    write_episode_record(record)
+                except Exception:
+                    LOGGER.exception("Failed to persist the Speed-RL finalization error")
                 LOGGER.exception("Episode finalization failed")
 
         self._finalizer = threading.Thread(
@@ -542,9 +668,16 @@ class SpeedRLKionClient:
         )
         self._finalizer.start()
 
+    def _cache_learner_stats(self, stats: Mapping[str, Any]) -> None:
+        with self._learner_stats_lock:
+            self._learner_stats = dict(stats)
+
     def status(self) -> dict[str, Any]:
         diagnostics = self.agent.diagnostics()
         safety = self.safety.status()
+        with self._learner_stats_lock:
+            learner_stats = dict(self._learner_stats)
+        activated_decisions = int(diagnostics.get("speed_rl_activated_decisions") or 0)
         return {
             "state": self.state.value,
             "mode": "speed-rl",
@@ -567,13 +700,26 @@ class SpeedRLKionClient:
             "speed_action": diagnostics.get("speed_rl_active_action_index"),
             "speed_scale": diagnostics.get("speed_rl_active_scale"),
             "policy_version": diagnostics.get("speed_rl_policy_version"),
+            "epsilon": 0.0
+            if self.phase == "greedy"
+            else epsilon_for_decisions(activated_decisions),
+            "activated_decisions": activated_decisions,
+            "discarded_decisions": diagnostics.get("speed_rl_discarded_decisions"),
+            "replay_size": learner_stats.get("replay_size"),
+            "replay_action_counts": learner_stats.get("action_counts"),
+            "learner_update_count": learner_stats.get("update_count"),
+            "online_training_ready": learner_stats.get("online_training_ready"),
+            "per_beta": learner_stats.get("beta"),
             "speed_violation": safety.violation_latched,
             "twist_stale": safety.twist_stale,
             "action_mask": safety.action_mask,
+            "stale_fields": self._stale_fields,
+            "critical_stale_fields": self._critical_stale_fields,
             "calibration": asdict(self.calibration.state),
             "online_episodes_remaining": self._online_budget.remaining,
             "greedy_acceptance": self._greedy_acceptance.result(),
             "last_outcome": self._last_outcome,
+            "last_safe_success": self._last_safe_success,
             "tracking_log": self._tracking_log,
             "finalization_in_progress": (
                 self._finalizer is not None and self._finalizer.is_alive()
@@ -623,7 +769,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run independent Speed-RL over the bimanual GR00T TOPPRA rollout."
     )
     parser.add_argument("--server-host", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=5555)
+    parser.add_argument("--server-port", type=int, default=47866)
     parser.add_argument("--timeout-ms", type=int, default=15_000)
     parser.add_argument("--policy-frequency", type=_positive_float, default=30.0)
     parser.add_argument("--control-frequency", type=_positive_float, default=250.0)
@@ -658,7 +804,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--async-verification", type=Path)
     parser.add_argument("--refill-threshold", type=int, default=20)
-    parser.add_argument("--max-latency-s", type=float, default=0.12)
+    parser.add_argument("--max-latency-s", type=float, default=0.35)
     parser.add_argument("--scheduling-margin-s", type=float, default=0.05)
     parser.add_argument("--handoff-margin-s", type=float, default=0.05)
     parser.add_argument("--open-loop-horizon", type=int, default=8)
@@ -678,6 +824,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ros-namespace", default="/gr00t_rollout")
     parser.add_argument("--disable-pinch", action="store_true")
     parser.add_argument("--pinch-max-rate-hz", type=_positive_float, default=30.0)
+    parser.add_argument("--left-camera-topic", default=KionTopics.left_camera)
+    parser.add_argument("--right-camera-topic", default=KionTopics.right_camera)
+    parser.add_argument("--head-camera-topic", default=KionTopics.head_camera)
     return parser.parse_args(argv)
 
 
@@ -759,83 +908,92 @@ def main(argv: list[str] | None = None) -> None:
     LOGGER.info("Discovered Speed-RL server contract: %s", contract.to_dict())
     rainbow_config = RainbowConfig(feature_dim=contract.feature_dim)
     actor = SpeedActor(rainbow_config)
-    learner = LearnerProcess(rainbow_config, contract)
     checkpoint = args.checkpoint or args.state_root / "speed_rl.pt"
     if (args.inference_mode == "async" or args.phase == "greedy") and not checkpoint.exists():
-        learner.close()
         raise ValueError(
             "Async or greedy Speed-RL requires an existing synchronous-training checkpoint"
         )
-    if checkpoint.exists():
-        learner.load(checkpoint)
-    learner_stats = learner.stats()
-    calibration = CalibrationManager(args.state_root / "calibration.json")
-    safety = SpeedViolationMonitor(
-        parse_twist_thresholds(args.left_twist_thresholds),
-        parse_twist_thresholds(args.right_twist_thresholds),
-    )
-    limits = CartesianLimits(
-        max_linear_velocity=(1.0,) * 3,
-        max_angular_velocity=(3.0,) * 3,
-        max_linear_acceleration=(5.0,) * 3,
-        max_angular_acceleration=(15.0,) * 3,
-        safety_margin=1.0,
-    )
     ros_types = load_ros_types()
     ros_types.rospy.init_node(args.node_name, disable_signals=False)
-    agent = SpeedRLAgent(
-        host=args.server_host,
-        port=args.server_port,
-        fps=args.policy_frequency,
-        refill_threshold=args.refill_threshold,
-        max_latency_s=args.max_latency_s,
-        task_default=args.task,
-        timeout_ms=args.timeout_ms,
-        left_limits=limits,
-        right_limits=limits,
-        inference_mode=args.inference_mode,
-        control_frequency=args.control_frequency,
-        scheduling_margin_s=args.scheduling_margin_s,
-        handoff_margin_s=args.handoff_margin_s,
-        open_loop_horizon=args.open_loop_horizon,
-        tts_samples=args.tts_samples,
-        tts_waypoint_count=args.tts_waypoint_count,
-        left_velocity_state_key=LEFT_TWIST_KEY,
-        right_velocity_state_key=RIGHT_TWIST_KEY,
-        velocity_filter=args.velocity_filter,
-        include_velocity_in_policy_observation=False,
-        feature_contract=contract,
-        speed_actor=actor,
-        greedy=args.phase == "greedy",
-        activated_decisions=learner_stats["activated_decisions"],
-    )
-    client = SpeedRLKionClient(
-        ros_types=ros_types,
-        topics=KionTopics(),
-        agent=agent,
-        actor=actor,
-        learner=learner,
-        safety=safety,
-        calibration=calibration,
-        phase=args.phase,
-        checkpoint_path=checkpoint,
-        log_root=args.log_root,
-        control_frequency=args.control_frequency,
-        servo_gain=args.servo_gain,
-        startup_timeout_s=args.startup_timeout_s,
-        max_state_age_s=args.max_state_age_s,
-        max_image_age_s=args.max_image_age_s,
-        task=args.task,
-        dry_run=args.dry_run,
-        episode_duration_s=args.episode_duration_s,
-        control_interface=args.control_interface,
-        ros_namespace=args.ros_namespace,
-        pinch_enabled=not args.disable_pinch,
-        pinch_max_rate_hz=args.pinch_max_rate_hz,
-    )
+    learner = LearnerProcess(rainbow_config, contract)
+    agent: SpeedRLAgent | None = None
+    client: SpeedRLKionClient | None = None
     try:
+        if checkpoint.exists():
+            learner.load(checkpoint)
+        learner_stats = learner.stats()
+        calibration = CalibrationManager(args.state_root / "calibration.json")
+        safety = SpeedViolationMonitor(
+            parse_twist_thresholds(args.left_twist_thresholds),
+            parse_twist_thresholds(args.right_twist_thresholds),
+        )
+        limits = CartesianLimits(
+            max_linear_velocity=(1.0,) * 3,
+            max_angular_velocity=(3.0,) * 3,
+            max_linear_acceleration=(5.0,) * 3,
+            max_angular_acceleration=(15.0,) * 3,
+            safety_margin=1.0,
+        )
+        agent = SpeedRLAgent(
+            host=args.server_host,
+            port=args.server_port,
+            fps=args.policy_frequency,
+            refill_threshold=args.refill_threshold,
+            max_latency_s=args.max_latency_s,
+            task_default=args.task,
+            timeout_ms=args.timeout_ms,
+            left_limits=limits,
+            right_limits=limits,
+            inference_mode=args.inference_mode,
+            control_frequency=args.control_frequency,
+            scheduling_margin_s=args.scheduling_margin_s,
+            handoff_margin_s=args.handoff_margin_s,
+            open_loop_horizon=args.open_loop_horizon,
+            tts_samples=args.tts_samples,
+            tts_waypoint_count=args.tts_waypoint_count,
+            left_velocity_state_key=LEFT_TWIST_KEY,
+            right_velocity_state_key=RIGHT_TWIST_KEY,
+            velocity_filter=args.velocity_filter,
+            include_velocity_in_policy_observation=False,
+            feature_contract=contract,
+            speed_actor=actor,
+            greedy=args.phase == "greedy",
+            activated_decisions=learner_stats["activated_decisions"],
+        )
+        client = SpeedRLKionClient(
+            ros_types=ros_types,
+            topics=KionTopics(
+                left_camera=args.left_camera_topic,
+                right_camera=args.right_camera_topic,
+                head_camera=args.head_camera_topic,
+            ),
+            agent=agent,
+            actor=actor,
+            learner=learner,
+            safety=safety,
+            calibration=calibration,
+            phase=args.phase,
+            checkpoint_path=checkpoint,
+            log_root=args.log_root,
+            control_frequency=args.control_frequency,
+            servo_gain=args.servo_gain,
+            startup_timeout_s=args.startup_timeout_s,
+            max_state_age_s=args.max_state_age_s,
+            max_image_age_s=args.max_image_age_s,
+            task=args.task,
+            dry_run=args.dry_run,
+            episode_duration_s=args.episode_duration_s,
+            control_interface=args.control_interface,
+            ros_namespace=args.ros_namespace,
+            pinch_enabled=not args.disable_pinch,
+            pinch_max_rate_hz=args.pinch_max_rate_hz,
+        )
         client.run()
     finally:
-        if client.state != EpisodeState.CLOSED:
-            client.close()
-        learner.close()
+        try:
+            if client is not None and client.state != EpisodeState.CLOSED:
+                client.close()
+            elif client is None and agent is not None:
+                agent.teardown()
+        finally:
+            learner.close()

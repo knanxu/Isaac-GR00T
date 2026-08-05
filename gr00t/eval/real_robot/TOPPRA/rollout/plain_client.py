@@ -17,19 +17,19 @@ from typing import Any
 
 import numpy as np
 
-from ..eval_toppra_bimanual import DEFAULT_TASK, CartesianLimits, GR00TAgent
+from ..eval_toppra_bimanual import DEFAULT_TASK, CartesianLimits, GR00TAgent, GR00TPolicyClient
 from ..kion_client.client import (
     LEFT_TARGET_KEY,
     LEFT_TWIST_KEY,
     RIGHT_TARGET_KEY,
     RIGHT_TWIST_KEY,
     KionDualArmServo,
-    KionObservationBuffer,
     KionTopics,
     RosTypes,
     load_ros_types,
 )
 from ..kion_client.tracking import TrackingRecorder, make_tracking_row
+from .observation import RolloutObservationBuffer, policy_observation, rollout_staleness
 from .operator import RosEpisodeBridge
 from .pinch import KionPinchExecutor
 
@@ -91,7 +91,7 @@ class PlainKionEpisodeClient:
         self.pinch_enabled = bool(pinch_enabled)
         self.pinch_max_rate_hz = float(pinch_max_rate_hz)
 
-        self.observations = KionObservationBuffer(ros_types, topics)
+        self.observations = RolloutObservationBuffer(ros_types, topics)
         self.agent: GR00TAgent | None = None
         self.servo: KionDualArmServo | None = None
         self.pinch: KionPinchExecutor | None = None
@@ -108,8 +108,12 @@ class PlainKionEpisodeClient:
         self._finalizer: threading.Thread | None = None
         self._finalization_error: str | None = None
         self._last_outcome: str | None = None
+        self._last_safe_success: bool | None = None
         self._tracking_log: str | None = None
         self._last_command_error: str | None = None
+        self._stale_fields: tuple[str, ...] = ()
+        self._critical_stale_fields: tuple[str, ...] = ()
+        self._twist_stale = True
 
     def enqueue_command(self, command: str) -> None:
         self._commands.put(command)
@@ -164,6 +168,10 @@ class PlainKionEpisodeClient:
                 max_state_age_s=self.max_state_age_s,
                 max_image_age_s=self.max_image_age_s,
             )
+            critical_stale, twist_stale = rollout_staleness(snapshot.stale_fields)
+            self._stale_fields = snapshot.stale_fields
+            self._critical_stale_fields = critical_stale
+            self._twist_stale = twist_stale
             self._drain_commands()
             if (
                 self.state == EpisodeState.RUNNING
@@ -180,12 +188,20 @@ class PlainKionEpisodeClient:
                 "active_buffer_size": 0,
             }
             if self.state == EpisodeState.RUNNING:
-                if snapshot.stale_fields:
+                if self.pinch is not None:
+                    self.pinch.raise_if_failed()
+                if critical_stale:
                     target_left, target_right = self._hold_target(snapshot)
-                    diagnostics["execution_state"] = "state_stale_hold"
+                    diagnostics["execution_state"] = "critical_observation_stale_hold"
                 else:
                     assert self.agent is not None
-                    action = self.agent.act(snapshot.observation, self.task)
+                    action = self.agent.act(
+                        policy_observation(
+                            snapshot.observation,
+                            twist_stale=twist_stale,
+                        ),
+                        self.task,
+                    )
                     target_left = np.asarray(action[LEFT_TARGET_KEY], dtype=np.float64)
                     target_right = np.asarray(action[RIGHT_TARGET_KEY], dtype=np.float64)
                     self._last_target = {
@@ -318,48 +334,77 @@ class PlainKionEpisodeClient:
             raise RuntimeError(
                 f"The previous episode failed to finalize: {self._finalization_error}"
             )
+        if self._critical_stale_fields:
+            raise RuntimeError(
+                "Cannot start while required rollout observations are stale: "
+                + ", ".join(self._critical_stale_fields)
+            )
 
         self._close_episode_resources()
         if self.agent is not None:
             self.agent.teardown()
-        self.agent = self.agent_factory()
-        self.servo = KionDualArmServo(
-            self.ros_types,
-            self.topics,
-            control_frequency=self.control_frequency,
-            gain=self.servo_gain,
-            dry_run=self.dry_run,
+            self.agent = None
+        agent: GR00TAgent | None = None
+        servo: KionDualArmServo | None = None
+        pinch: KionPinchExecutor | None = None
+        recorder: TrackingRecorder | None = None
+        next_episode = self.episode_number + 1
+        run_directory = self.log_root / (
+            datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_episode_{next_episode:03d}"
         )
-        self.servo.wait_for_connection(self.startup_timeout_s)
-        self.servo.configure(self.startup_timeout_s)
-        if self.pinch_enabled:
-            self.pinch = KionPinchExecutor(
-                self.rospy,
-                self.ros_types.hand_namespace,
-                max_rate_hz=self.pinch_max_rate_hz,
+        try:
+            agent = self.agent_factory()
+            servo = KionDualArmServo(
+                self.ros_types,
+                self.topics,
+                control_frequency=self.control_frequency,
+                gain=self.servo_gain,
                 dry_run=self.dry_run,
             )
+            servo.wait_for_connection(self.startup_timeout_s)
+            servo.configure(self.startup_timeout_s)
+            if self.pinch_enabled:
+                pinch = KionPinchExecutor(
+                    self.rospy,
+                    self.ros_types.hand_namespace,
+                    max_rate_hz=self.pinch_max_rate_hz,
+                    dry_run=self.dry_run,
+                )
+            recorder = TrackingRecorder(
+                run_directory,
+                {
+                    "episode": next_episode,
+                    "mode": "plain",
+                    "inference_mode": self.inference_mode,
+                    "task": self.task,
+                    "control_frequency": self.control_frequency,
+                    "topics": asdict(self.topics),
+                },
+            )
+        except BaseException:
+            for resource in (recorder, pinch, servo):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception:
+                        LOGGER.exception("Failed to clean up a partial rollout start")
+            if agent is not None:
+                try:
+                    agent.teardown()
+                except Exception:
+                    LOGGER.exception("Failed to stop the partial rollout agent")
+            raise
 
-        self.episode_number += 1
-        run_directory = self.log_root / (
-            datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            + f"_episode_{self.episode_number:03d}"
-        )
-        self.recorder = TrackingRecorder(
-            run_directory,
-            {
-                "episode": self.episode_number,
-                "mode": "plain",
-                "inference_mode": self.inference_mode,
-                "task": self.task,
-                "control_frequency": self.control_frequency,
-                "topics": asdict(self.topics),
-            },
-        )
-        self._tracking_log = str(self.recorder.csv_path)
+        self.agent = agent
+        self.servo = servo
+        self.pinch = pinch
+        self.recorder = recorder
+        self.episode_number = next_episode
+        self._tracking_log = str(recorder.csv_path)
         self._sample_index = 0
         self._last_target = None
         self._last_outcome = None
+        self._last_safe_success = None
         self._episode_started_s = time.monotonic()
         self.state = EpisodeState.RUNNING
         LOGGER.info(
@@ -382,6 +427,7 @@ class PlainKionEpisodeClient:
         self.recorder = None
         self.state = EpisodeState.TERMINATED
         self._last_outcome = "success" if success else "failure"
+        self._last_safe_success = bool(success and not control_fault)
         self._schedule_finalization(
             recorder,
             {
@@ -402,6 +448,7 @@ class PlainKionEpisodeClient:
         self._close_motion_resources()
         self.state = EpisodeState.ABORTED
         self._last_outcome = "abort"
+        self._last_safe_success = False
         self._schedule_finalization(
             recorder,
             {
@@ -464,8 +511,11 @@ class PlainKionEpisodeClient:
             "speed_action": None,
             "speed_scale": None,
             "speed_violation": False,
-            "twist_stale": None,
+            "twist_stale": self._twist_stale,
+            "stale_fields": self._stale_fields,
+            "critical_stale_fields": self._critical_stale_fields,
             "last_outcome": self._last_outcome,
+            "last_safe_success": self._last_safe_success,
             "tracking_log": self._tracking_log,
             "finalization_in_progress": (
                 self._finalizer is not None and self._finalizer.is_alive()
@@ -520,14 +570,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run episode-driven plain TOPPRA rollout with GUI or terminal labeling."
     )
     parser.add_argument("--server-host", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=5555)
+    parser.add_argument("--server-port", type=int, default=47866)
     parser.add_argument("--timeout-ms", type=int, default=15_000)
     parser.add_argument("--policy-frequency", type=_positive_float, default=30.0)
     parser.add_argument("--control-frequency", type=_positive_float, default=250.0)
     parser.add_argument("--inference-mode", choices=("sync", "async"), default="sync")
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--refill-threshold", type=int, default=20)
-    parser.add_argument("--max-latency-s", type=float, default=0.12)
+    parser.add_argument("--max-latency-s", type=float, default=0.35)
     parser.add_argument("--scheduling-margin-s", type=float, default=0.05)
     parser.add_argument("--handoff-margin-s", type=float, default=0.05)
     parser.add_argument("--open-loop-horizon", type=int, default=8)
@@ -571,6 +621,12 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
     )
+    preflight = GR00TPolicyClient(args.server_host, args.server_port, timeout_ms=args.timeout_ms)
+    try:
+        preflight.ping()
+    finally:
+        preflight.close()
+    LOGGER.info("Policy server preflight passed: %s:%d", args.server_host, args.server_port)
     ros_types = load_ros_types()
     ros_types.rospy.init_node(args.node_name, disable_signals=False)
     topics = KionTopics(
