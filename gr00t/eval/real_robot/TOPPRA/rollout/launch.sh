@@ -38,8 +38,20 @@ if [[ -n "${ROBOT_ROS_SETUP:-}" ]]; then
 fi
 
 mode="${ROLLOUT_MODE:-plain}"
-if [[ "${mode}" != "plain" && "${mode}" != "speed-rl" ]]; then
-    echo "ROLLOUT_MODE must be plain or speed-rl, got: ${mode}" >&2
+if [[ "${mode}" != "plain" && "${mode}" != "speed-rl" && "${mode}" != "speed-rl-baseline" ]]; then
+    echo "ROLLOUT_MODE must be plain, speed-rl, or speed-rl-baseline, got: ${mode}" >&2
+    exit 2
+fi
+
+control_interface="${CONTROL_INTERFACE:-gui}"
+if [[ "${control_interface}" == "terminal" ]]; then
+    echo "Control interface: terminal (ObservationGUILite services and window are disabled)."
+elif [[ "${control_interface}" == "gui" || "${control_interface}" == "both" ]]; then
+    echo "Control interface: ${control_interface} (ROS GUI services enabled)."
+    echo "ObservationGUILite is a separate process; launch it from another terminal with:"
+    echo "  bash gr00t/eval/real_robot/TOPPRA/rollout/launch_gui.sh ${config_path}"
+else
+    echo "CONTROL_INTERFACE must be terminal, gui, or both, got: ${control_interface}" >&2
     exit 2
 fi
 
@@ -65,13 +77,35 @@ command=(
     --max-state-age-s "${MAX_STATE_AGE_S:-0.25}"
     --max-image-age-s "${MAX_IMAGE_AGE_S:-1.0}"
     --episode-duration-s "${EPISODE_DURATION_S:-80}"
-    --control-interface "${CONTROL_INTERFACE:-gui}"
+    --control-interface "${control_interface}"
     --ros-namespace "${ROS_NAMESPACE:-/gr00t_rollout}"
     --pinch-max-rate-hz "${PINCH_MAX_RATE_HZ:-30}"
+    --reset-mode "${RESET_MODE:-manual}"
+    --reset-service "${RESET_SERVICE:-/zj_humanoid/upperlimb/go_home/dual_arm}"
+    --reset-timeout-s "${RESET_TIMEOUT_S:-10}"
     --left-camera-topic "${LEFT_CAMERA_TOPIC:-/zj_humanoid/sensor/left_wrist/image_raw/compressed}"
     --right-camera-topic "${RIGHT_CAMERA_TOPIC:-/zj_humanoid/sensor/right_wrist/image_raw/compressed}"
     --head-camera-topic "${HEAD_CAMERA_TOPIC:-/zj_humanoid/sensor/realsense_head/color/image_raw/compressed}"
 )
+
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    : "${LEFT_WORKSPACE_BOUNDS:?set certified LEFT_WORKSPACE_BOUNDS for real motion}"
+    : "${RIGHT_WORKSPACE_BOUNDS:?set certified RIGHT_WORKSPACE_BOUNDS for real motion}"
+    : "${MAX_TARGET_POSITION_ERROR_M:?set certified MAX_TARGET_POSITION_ERROR_M for real motion}"
+    : "${MAX_TARGET_ROTATION_ERROR_RAD:?set certified MAX_TARGET_ROTATION_ERROR_RAD for real motion}"
+fi
+if [[ -n "${LEFT_WORKSPACE_BOUNDS:-}" ]]; then
+    command+=("--left-workspace-bounds=${LEFT_WORKSPACE_BOUNDS}")
+fi
+if [[ -n "${RIGHT_WORKSPACE_BOUNDS:-}" ]]; then
+    command+=("--right-workspace-bounds=${RIGHT_WORKSPACE_BOUNDS}")
+fi
+if [[ -n "${MAX_TARGET_POSITION_ERROR_M:-}" ]]; then
+    command+=(--max-target-position-error-m "${MAX_TARGET_POSITION_ERROR_M}")
+fi
+if [[ -n "${MAX_TARGET_ROTATION_ERROR_RAD:-}" ]]; then
+    command+=(--max-target-rotation-error-rad "${MAX_TARGET_ROTATION_ERROR_RAD}")
+fi
 
 if [[ "${mode}" == "plain" ]]; then
     command+=(
@@ -85,15 +119,38 @@ if [[ "${mode}" == "plain" ]]; then
 else
     : "${LEFT_TWIST_THRESHOLDS:?set certified LEFT_TWIST_THRESHOLDS for Speed-RL}"
     : "${RIGHT_TWIST_THRESHOLDS:?set certified RIGHT_TWIST_THRESHOLDS for Speed-RL}"
+    execution_backend="toppra"
+    state_root="${SPEED_RL_STATE_ROOT:-logs/kion_speed_rl/state}"
+    log_root="${SPEED_RL_LOG_ROOT:-logs/kion_speed_rl/episodes}"
+    checkpoint="${SPEED_RL_CHECKPOINT:-}"
+    if [[ "${mode}" == "speed-rl-baseline" ]]; then
+        execution_backend="interpolation"
+        state_root="${BASELINE_SPEED_RL_STATE_ROOT:-logs/kion_speed_rl_baseline/state}"
+        log_root="${BASELINE_SPEED_RL_LOG_ROOT:-logs/kion_speed_rl_baseline/episodes}"
+        checkpoint="${BASELINE_SPEED_RL_CHECKPOINT:-}"
+    fi
     command+=(
+        --execution-backend "${execution_backend}"
+        --baseline-action-frequency "${BASELINE_ACTION_FREQUENCY:-30}"
+        --baseline-k-skip "${BASELINE_K_SKIP:-10}"
+        --baseline-speed-min "${BASELINE_SPEED_MIN:-1.0}"
+        --baseline-speed-max "${BASELINE_SPEED_MAX:-4.0}"
+        --baseline-speed-step "${BASELINE_SPEED_STEP:-0.5}"
+        --toppra-speed-min "${TOPPRA_SPEED_MIN:-0.7}"
+        --toppra-speed-max "${TOPPRA_SPEED_MAX:-1.6}"
+        --toppra-speed-step "${TOPPRA_SPEED_STEP:-0.3}"
+        --policy-chunk-horizon "${POLICY_CHUNK_HORIZON:-40}"
+        --toppra-execution-horizon "${TOPPRA_EXECUTION_HORIZON:-30}"
+        --rainbow-hidden-dim "${RAINBOW_HIDDEN_DIM:-256}"
+        --online-episodes "${ONLINE_EPISODES:-100}"
         --phase "${SPEED_RL_PHASE:-calibration}"
         --left-twist-thresholds "${LEFT_TWIST_THRESHOLDS}"
         --right-twist-thresholds "${RIGHT_TWIST_THRESHOLDS}"
-        --state-root "${SPEED_RL_STATE_ROOT:-logs/kion_speed_rl/state}"
-        --log-root "${SPEED_RL_LOG_ROOT:-logs/kion_speed_rl/episodes}"
+        --state-root "${state_root}"
+        --log-root "${log_root}"
     )
-    if [[ -n "${SPEED_RL_CHECKPOINT:-}" ]]; then
-        command+=(--checkpoint "${SPEED_RL_CHECKPOINT}")
+    if [[ -n "${checkpoint}" ]]; then
+        command+=(--checkpoint "${checkpoint}")
     fi
     if [[ -n "${ASYNC_VERIFICATION:-}" ]]; then
         command+=(--async-verification "${ASYNC_VERIFICATION}")

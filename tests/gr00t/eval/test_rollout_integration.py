@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import Enum, auto
 import importlib.util
 import json
+import logging
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -10,6 +11,14 @@ from typing import Any
 
 from gr00t.eval.real_robot.TOPPRA.kion_client.client import KionTopics
 from gr00t.eval.real_robot.TOPPRA.rollout import plain_client as plain_module
+from gr00t.eval.real_robot.TOPPRA.rollout.hardware_safety import (
+    TargetSafetyError,
+    TargetSafetyGuard,
+    mock_camera_publishers,
+    parse_workspace_bounds,
+)
+from gr00t.eval.real_robot.TOPPRA.rollout.local_sim_hardware import require_loopback_master
+from gr00t.eval.real_robot.TOPPRA.rollout.mock_inputs import MockInputTopics, PipelineMockInputRelay
 from gr00t.eval.real_robot.TOPPRA.rollout.observation import (
     CRITICAL_ROLLOUT_KEYS,
     LOCAL_TWIST_KEYS,
@@ -17,7 +26,11 @@ from gr00t.eval.real_robot.TOPPRA.rollout.observation import (
     policy_observation,
     rollout_staleness,
 )
-from gr00t.eval.real_robot.TOPPRA.rollout.operator import RosEpisodeBridge, status_json
+from gr00t.eval.real_robot.TOPPRA.rollout.operator import (
+    RosEpisodeBridge,
+    restore_console_logging,
+    status_json,
+)
 from gr00t.eval.real_robot.TOPPRA.rollout.pinch import (
     LEFT_HIGH,
     LEFT_LOW,
@@ -26,8 +39,10 @@ from gr00t.eval.real_robot.TOPPRA.rollout.pinch import (
     pinch_posture,
 )
 from gr00t.eval.real_robot.TOPPRA.rollout.plain_client import _parse_args as parse_plain_args
+from gr00t.eval.real_robot.TOPPRA.rollout.reset import EpisodeResetController
 from gr00t.eval.real_robot.TOPPRA.speed_rl.client import _parse_args as parse_speed_args
 import numpy as np
+import pytest
 
 
 class _TriggerResponse:
@@ -77,6 +92,53 @@ class _Rospy:
         return service
 
 
+class _RelayEndpoint:
+    def __init__(self, topic: str, callback: Any | None = None) -> None:
+        self.topic = topic
+        self.callback = callback
+        self.messages: list[Any] = []
+        self.closed = False
+
+    def publish(self, message: Any) -> None:
+        self.messages.append(message)
+
+    def unregister(self) -> None:
+        self.closed = True
+
+
+class _RelayRospy:
+    def __init__(self, published_topics: tuple[str, ...] = ()) -> None:
+        self.initial_published_topics = published_topics
+        self.publishers: dict[str, _RelayEndpoint] = {}
+        self.subscribers: dict[str, _RelayEndpoint] = {}
+        self.logs: list[str] = []
+
+    def resolve_name(self, name: str) -> str:
+        return name if name.startswith("/") else f"/{name}"
+
+    def get_published_topics(self, _namespace: str) -> list[tuple[str, str]]:
+        return [(topic, "test/Message") for topic in self.initial_published_topics]
+
+    def Publisher(self, topic: str, *_args: Any, **_kwargs: Any) -> _RelayEndpoint:  # noqa: N802
+        endpoint = _RelayEndpoint(topic)
+        self.publishers[topic] = endpoint
+        return endpoint
+
+    def Subscriber(  # noqa: N802
+        self,
+        topic: str,
+        _message_type: Any,
+        callback: Any,
+        **_kwargs: Any,
+    ) -> _RelayEndpoint:
+        endpoint = _RelayEndpoint(topic, callback)
+        self.subscribers[topic] = endpoint
+        return endpoint
+
+    def loginfo(self, message: str, source: str) -> None:
+        self.logs.append(message % source)
+
+
 def test_rollout_status_json_normalizes_numpy_and_nonfinite_values() -> None:
     encoded = status_json(
         {
@@ -92,6 +154,137 @@ def test_rollout_status_json_normalizes_numpy_and_nonfinite_values() -> None:
         "mask": [True, False],
         "nested": [1.25],
     }
+
+
+def test_restore_console_logging_is_idempotent() -> None:
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    existing = [
+        handler
+        for handler in root_logger.handlers
+        if getattr(handler, "_gr00t_console_handler", False)
+    ]
+    for handler in existing:
+        root_logger.removeHandler(handler)
+    try:
+        first = restore_console_logging()
+        second = restore_console_logging()
+        assert first is second
+        assert (
+            sum(
+                bool(getattr(handler, "_gr00t_console_handler", False))
+                for handler in root_logger.handlers
+            )
+            == 1
+        )
+    finally:
+        for handler in tuple(root_logger.handlers):
+            if getattr(handler, "_gr00t_console_handler", False):
+                root_logger.removeHandler(handler)
+        for handler in existing:
+            root_logger.addHandler(handler)
+        root_logger.setLevel(original_level)
+
+
+def test_pipeline_mock_relay_forwards_inputs_and_never_creates_command_publishers() -> None:
+    fake_rospy = _RelayRospy()
+    topics = MockInputTopics()
+    relay = PipelineMockInputRelay(fake_rospy, object, topics)
+
+    head_message = object()
+    fake_rospy.subscribers[topics.head_camera].callback(head_message)
+
+    assert relay.ready
+    assert fake_rospy.publishers[topics.left_wrist_camera].messages == [head_message]
+    assert fake_rospy.publishers[topics.right_wrist_camera].messages == [head_message]
+    assert not any("servo" in topic or "hand" in topic for topic in fake_rospy.publishers)
+
+    relay.close()
+    assert all(endpoint.closed for endpoint in fake_rospy.publishers.values())
+    assert all(endpoint.closed for endpoint in fake_rospy.subscribers.values())
+
+
+def test_pipeline_mock_relay_refuses_to_mask_real_publishers() -> None:
+    topics = MockInputTopics()
+    fake_rospy = _RelayRospy((topics.left_wrist_camera,))
+
+    with pytest.raises(RuntimeError, match="Refusing to mask existing ROS publishers"):
+        PipelineMockInputRelay(fake_rospy, object, topics)
+
+
+def test_local_hardware_simulator_requires_loopback_ros_master() -> None:
+    require_loopback_master("http://127.0.0.1:11312")
+    require_loopback_master("http://localhost:11311")
+
+    with pytest.raises(RuntimeError, match="loopback ROS master"):
+        require_loopback_master("http://192.168.217.1:11311")
+
+
+def test_hardware_target_guard_checks_workspace_and_tracking_error() -> None:
+    workspace = parse_workspace_bounds("0.2,1.0,-0.8,0.8,0.1,1.5")
+    guard = TargetSafetyGuard(
+        workspace,
+        workspace,
+        max_position_error_m=0.1,
+        max_rotation_error_rad=0.2,
+    )
+    measured = np.array([0.5, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0])
+    guard.validate(measured, measured, measured, measured)
+
+    outside = measured.copy()
+    outside[0] = 1.01
+    with pytest.raises(TargetSafetyError, match="outside certified workspace"):
+        guard.validate(outside, measured, measured, measured)
+
+    far = measured.copy()
+    far[1] = 0.11
+    with pytest.raises(TargetSafetyError, match="tracking error"):
+        guard.validate(far, measured, measured, measured)
+
+    rotated = measured.copy()
+    rotated[3:] = [np.cos(0.11), np.sin(0.11), 0.0, 0.0]
+    with pytest.raises(TargetSafetyError, match="rotation error"):
+        guard.validate(rotated, measured, measured, measured)
+
+
+def test_hardware_target_guard_rejects_invalid_bounds() -> None:
+    with pytest.raises(ValueError, match="strictly below"):
+        parse_workspace_bounds("1,0,-1,1,0,1")
+    with pytest.raises(ValueError, match="six"):
+        parse_workspace_bounds("0,1,0,1")
+
+
+def test_real_motion_detects_test_only_camera_relay() -> None:
+    class Master:
+        def getSystemState(self) -> tuple[int, str, list[Any]]:  # noqa: N802
+            return (
+                1,
+                "ok",
+                [
+                    [
+                        (
+                            "/left/image",
+                            ["/gr00t_rollout/gr00t_pipeline_mock_inputs_123"],
+                        ),
+                        ("/head/image", ["/real_camera"]),
+                    ],
+                    [],
+                    [],
+                ],
+            )
+
+    class Rospy:
+        @staticmethod
+        def get_master() -> Master:
+            return Master()
+
+        @staticmethod
+        def resolve_name(topic: str) -> str:
+            return topic
+
+    assert mock_camera_publishers(Rospy(), ("/left/image", "/head/image")) == (
+        "/gr00t_rollout/gr00t_pipeline_mock_inputs_123",
+    )
 
 
 def test_ros_episode_bridge_queues_commands_and_publishes_status(monkeypatch) -> None:
@@ -120,6 +313,9 @@ def test_ros_episode_bridge_queues_commands_and_publishes_status(monkeypatch) ->
     assert commands == ["start"]
     fake_rospy.services["/test_rollout/approve"].callback(None)
     assert commands[-1].startswith("approve ObservationGUILite")
+    fake_rospy.services["/test_rollout/reset"].callback(None)
+    fake_rospy.services["/test_rollout/ready"].callback(None)
+    assert commands[-2:] == ["reset", "ready"]
 
     status_response = fake_rospy.services["/test_rollout/status"].callback(None)
     assert json.loads(status_response.message)["state"] == "running"
@@ -153,6 +349,38 @@ def test_unified_clients_default_to_sync_single_candidate_gui_control() -> None:
         assert args.control_interface == "gui"
         assert args.ros_namespace == "/gr00t_rollout"
         assert args.server_port == 47866
+        assert args.reset_mode == "manual"
+
+
+def test_go_home_reset_uses_sdk_trigger_and_requires_operator_confirmation() -> None:
+    class Rospy:
+        def __init__(self) -> None:
+            self.waited_for: tuple[str, float] | None = None
+            self.called_service: str | None = None
+
+        def wait_for_service(self, name: str, timeout: float) -> None:
+            self.waited_for = (name, timeout)
+
+        def ServiceProxy(self, name: str, _service_type: Any) -> Any:  # noqa: N802
+            self.called_service = name
+            return lambda: SimpleNamespace(success=True, message="home accepted")
+
+    rospy = Rospy()
+    controller = EpisodeResetController(
+        rospy,
+        mode="go-home",
+        service_name="/test/go_home",
+        service_timeout_s=3.0,
+    )
+    controller.begin()
+    controller.wait(1.0)
+    status = controller.status()
+
+    assert rospy.waited_for == ("/test/go_home", 3.0)
+    assert rospy.called_service == "/test/go_home"
+    assert status.home_request_complete
+    assert status.operator_may_confirm_ready
+    assert status.response == "home accepted"
 
 
 def test_rollout_observation_contract_ignores_pressure_and_omits_stale_twist() -> None:
@@ -251,7 +479,7 @@ def test_observation_gui_passively_saves_labels_and_discards_abort(monkeypatch) 
     loop.frames.extend([{}, {}, {}])
     panel._sync_passive_recording(
         {
-            "state": "terminated",
+            "state": "resetting",
             "episode": 3,
             "last_outcome": "success",
             "last_safe_success": True,
@@ -353,6 +581,14 @@ def test_plain_episode_lifecycle_recreates_agent_and_persists_operator_outcome(
     client._finalizer.join(timeout=2)
     assert client.state is plain_module.EpisodeState.TERMINATED
     assert json.loads((first_directory / "outcome.json").read_text())["success"] is True
+
+    with pytest.raises(RuntimeError, match="finish and reset first"):
+        client._start_episode()
+    client._begin_reset()
+    assert client.state is plain_module.EpisodeState.RESETTING
+    assert agents[0].closed
+    client._confirm_reset_ready()
+    assert client.state is plain_module.EpisodeState.IDLE
 
     client._start_episode()
     assert len(agents) == 2

@@ -53,6 +53,30 @@ class NStepTransition:
     steps: int
 
 
+@dataclass(frozen=True)
+class RainbowReplayTransition:
+    """Aligned one-step and n-step views used by the combined Rainbow loss."""
+
+    one_step: NStepTransition
+    n_step: NStepTransition
+
+    def __post_init__(self) -> None:
+        if self.one_step.steps != 1:
+            raise ValueError("one_step replay view must contain exactly one step")
+        if self.one_step.action != self.n_step.action:
+            raise ValueError("one-step and n-step replay actions lost alignment")
+        if not np.array_equal(self.one_step.state, self.n_step.state):
+            raise ValueError("one-step and n-step replay states lost alignment")
+
+    @property
+    def action(self) -> int:
+        return self.one_step.action
+
+    @property
+    def action_mask(self) -> BoolArray:
+        return self.one_step.action_mask
+
+
 def build_n_step_transitions(
     episode: Sequence[Transition],
     *,
@@ -94,9 +118,23 @@ def build_n_step_transitions(
     return result
 
 
+def build_rainbow_replay_transitions(
+    episode: Sequence[Transition],
+    *,
+    n_step: int,
+    gamma: float,
+) -> list[RainbowReplayTransition]:
+    one_step = build_n_step_transitions(episode, n_step=1, gamma=gamma)
+    multi_step = build_n_step_transitions(episode, n_step=n_step, gamma=gamma)
+    return [
+        RainbowReplayTransition(one_step=one, n_step=multi)
+        for one, multi in zip(one_step, multi_step, strict=True)
+    ]
+
+
 @dataclass(frozen=True)
 class ReplaySample:
-    transitions: tuple[NStepTransition, ...]
+    transitions: tuple[RainbowReplayTransition, ...]
     indices: NDArray[np.int64]
     weights: FloatArray
 
@@ -121,7 +159,7 @@ class PrioritizedReplayBuffer:
         self.capacity = int(capacity)
         self.alpha = float(alpha)
         self.priority_epsilon = float(priority_epsilon)
-        self._storage: list[NStepTransition] = []
+        self._storage: list[RainbowReplayTransition] = []
         self._priorities = np.zeros(self.capacity, dtype=np.float64)
         self._next_index = 0
         self._rng = np.random.default_rng(seed)
@@ -140,7 +178,11 @@ class PrioritizedReplayBuffer:
         )
         return tuple(int(count) for count in counts)
 
-    def add(self, transition: NStepTransition, priority: float | None = None) -> None:
+    def add(
+        self,
+        transition: RainbowReplayTransition,
+        priority: float | None = None,
+    ) -> None:
         if priority is None:
             priority = (
                 float(np.max(self._priorities[: len(self._storage)])) if self._storage else 1.0
@@ -155,7 +197,7 @@ class PrioritizedReplayBuffer:
         self._priorities[self._next_index] = value
         self._next_index = (self._next_index + 1) % self.capacity
 
-    def extend(self, transitions: Sequence[NStepTransition]) -> None:
+    def extend(self, transitions: Sequence[RainbowReplayTransition]) -> None:
         for transition in transitions:
             self.add(transition)
 

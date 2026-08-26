@@ -20,7 +20,7 @@ from ..eval_toppra_bimanual import (
     _InferenceRequest,
     _ReadyTrajectory,
 )
-from .config import SPEED_SCALES, epsilon_for_decisions
+from .config import TOPPRA_SPEED_VALUES, epsilon_for_decisions, validate_speed_values
 from .contract import (
     FeatureContract,
     extract_candidate_features,
@@ -36,6 +36,30 @@ from .replay import Transition
 LOGGER = logging.getLogger(__name__)
 FloatArray = NDArray[np.float32]
 BoolArray = NDArray[np.bool_]
+SPEED_REWARD_WEIGHT = 0.01
+SPEED_REWARD_FREQUENCY_HZ = 30.0
+TERMINAL_SUCCESS_BONUS = 100.0
+
+
+def speedtuning_reward(
+    speed: float,
+    executed_motion_s: float,
+    *,
+    terminal: bool,
+    safe_success: bool,
+) -> tuple[float, float, float, float]:
+    """Return total reward, speed reward, terminal bonus and 30 Hz-equivalent steps."""
+
+    speed = float(speed)
+    motion_s = float(executed_motion_s)
+    if not np.isfinite(speed) or speed <= 0.0:
+        raise ValueError("reward speed must be finite and positive")
+    if not np.isfinite(motion_s) or motion_s < 0.0:
+        raise ValueError("executed motion time must be finite and non-negative")
+    executed_steps = SPEED_REWARD_FREQUENCY_HZ * motion_s
+    speed_reward = SPEED_REWARD_WEIGHT * executed_steps * speed**2
+    terminal_bonus = TERMINAL_SUCCESS_BONUS if terminal and safe_success else 0.0
+    return speed_reward + terminal_bonus, speed_reward, terminal_bonus, executed_steps
 
 
 @dataclass
@@ -62,9 +86,9 @@ class _SpeedPlannerRouter:
                     right_limits=_limits_for_scale(scale),
                 )
             )
-            for index, scale in enumerate(SPEED_SCALES)
+            for index, scale in enumerate(agent.speed_values)
         }
-        self.selection_planner = self.planners[1]
+        self.selection_planner = next(iter(self.planners.values()))
         self.config = agent.config
 
     def __getattr__(self, name: str) -> Any:
@@ -97,7 +121,8 @@ class _SpeedPlannerRouter:
             raise RuntimeError(
                 f"TTS candidate index {candidate_index} has no aligned Speed-RL feature"
             )
-        feature = pool_candidate_feature(context.features[candidate_index])
+        candidate_feature = context.features[candidate_index]
+        feature = pool_candidate_feature(candidate_feature)
         action_mask = context.action_mask.copy()
         action_mask &= self._handoff_feasibility_mask(current_twist)
         with self.agent._speed_lock:
@@ -108,7 +133,7 @@ class _SpeedPlannerRouter:
                 else epsilon_for_decisions(self.agent._activated_decision_count)
             )
             fixed_action = self.agent._fixed_action
-        validate_action_mask(action_mask, len(SPEED_SCALES))
+        validate_action_mask(action_mask, len(self.agent.speed_values))
         action_index = self.agent.speed_actor.select(
             feature,
             action_mask,
@@ -116,8 +141,22 @@ class _SpeedPlannerRouter:
             fixed_action=fixed_action,
         )
         planner = self.planners[action_index]
+        source_horizons = {len(np.asarray(values)) for values in action_arrays.values()}
+        if len(source_horizons) != 1:
+            raise ValueError("TOPPRA action fields must share one source horizon")
+        source_horizon = next(iter(source_horizons))
+        execution_horizon = self.agent.toppra_execution_horizon
+        if source_horizon < execution_horizon:
+            raise RuntimeError(
+                "TOPPRA candidate is shorter than the configured execution horizon: "
+                f"source={source_horizon}, execution={execution_horizon}"
+            )
+        executed_actions = {
+            key: np.asarray(values)[:execution_horizon].copy()
+            for key, values in action_arrays.items()
+        }
         trajectory = planner.plan(
-            action_arrays,
+            executed_actions,
             current_pose,
             current_twist,
             **kwargs,
@@ -129,13 +168,18 @@ class _SpeedPlannerRouter:
                     "request_generation": context.request_generation,
                     "feature": feature.copy(),
                     "action_index": action_index,
-                    "speed_scale": SPEED_SCALES[action_index],
+                    "speed_scale": self.agent.speed_values[action_index],
                     "action_mask": action_mask.copy(),
                     "policy_version": self.agent.speed_actor.policy_version,
                     "episode_epoch": context.episode_epoch,
                     "tts_candidate_index": candidate_index,
                     "trajectory_duration_s": float(trajectory.duration),
                     "used_toppra": bool(trajectory.used_toppra),
+                    "execution_backend": "toppra",
+                    "feature_horizon": len(candidate_feature),
+                    "source_horizon": source_horizon,
+                    "execution_horizon": execution_horizon,
+                    "discarded_source_actions": source_horizon - execution_horizon,
                 }
                 assert context.planned_sequences is not None
                 context.planned_sequences.append(trajectory.sequence_id)
@@ -145,7 +189,7 @@ class _SpeedPlannerRouter:
         self,
         current_twist: dict[str, NDArray[np.float64]] | None,
     ) -> BoolArray:
-        mask = np.ones(len(SPEED_SCALES), dtype=np.bool_)
+        mask = np.ones(len(self.agent.speed_values), dtype=np.bool_)
         if self.agent.config.inference_mode != "async" or current_twist is None:
             return mask
         for action_index, planner in self.planners.items():
@@ -172,6 +216,8 @@ def _limits_for_scale(scale: float) -> CartesianLimits:
 class SpeedRLAgent(GR00TAgent):
     """Parallel Speed-RL agent that leaves the existing rollout implementation frozen."""
 
+    execution_backend = "toppra"
+
     def __init__(
         self,
         *args: Any,
@@ -179,23 +225,36 @@ class SpeedRLAgent(GR00TAgent):
         speed_actor: SpeedActor,
         greedy: bool = False,
         activated_decisions: int = 0,
+        speed_values: Sequence[float] = TOPPRA_SPEED_VALUES,
+        policy_chunk_horizon: int = 40,
+        toppra_execution_horizon: int = 30,
         **kwargs: Any,
     ) -> None:
         if speed_actor.config.feature_dim != feature_contract.feature_dim:
             raise ValueError("Actor feature dimension does not match the server feature contract")
         self.feature_contract = feature_contract
         self.speed_actor = speed_actor
+        self.speed_values = validate_speed_values(speed_values)
+        if len(self.speed_values) != speed_actor.config.action_count:
+            raise ValueError("Actor action_count does not match the configured speed values")
+        self.policy_chunk_horizon = int(policy_chunk_horizon)
+        self.toppra_execution_horizon = int(toppra_execution_horizon)
+        if self.policy_chunk_horizon < 1:
+            raise ValueError("policy_chunk_horizon must be positive")
+        if not 1 <= self.toppra_execution_horizon <= self.policy_chunk_horizon:
+            raise ValueError("TOPPRA execution horizon must lie inside the policy chunk")
         self._speed_lock = threading.Lock()
         self._feature_local = threading.local()
         self._episode_epoch = 0
         self._activated_decision_count = max(0, int(activated_decisions))
-        self._action_mask = np.ones(len(SPEED_SCALES), dtype=np.bool_)
+        self._action_mask = np.ones(len(self.speed_values), dtype=np.bool_)
         self._fixed_action: int | None = None
         self._greedy = bool(greedy)
         self.trajectory_decisions: dict[int, dict[str, Any]] = {}
         self._activation_events: list[dict[str, Any]] = []
         self._finished_episode_decisions: list[dict[str, Any]] = []
         self._discarded_decision_count = 0
+        self.speed_actor.set_greedy(self._greedy)
         super().__init__(*args, **kwargs)
         self.config = replace(
             self.config,
@@ -209,12 +268,12 @@ class SpeedRLAgent(GR00TAgent):
         return getattr(self._feature_local, "context", None)
 
     def set_action_mask(self, action_mask: Sequence[bool]) -> None:
-        mask = validate_action_mask(np.asarray(action_mask), len(SPEED_SCALES))
+        mask = validate_action_mask(np.asarray(action_mask), len(self.speed_values))
         with self._speed_lock:
             self._action_mask = mask
 
     def set_fixed_action(self, action_index: int | None) -> None:
-        if action_index is not None and not 0 <= int(action_index) < len(SPEED_SCALES):
+        if action_index is not None and not 0 <= int(action_index) < len(self.speed_values):
             raise ValueError("fixed Speed-RL action is out of range")
         with self._speed_lock:
             self._fixed_action = None if action_index is None else int(action_index)
@@ -222,6 +281,7 @@ class SpeedRLAgent(GR00TAgent):
     def set_greedy(self, greedy: bool) -> None:
         with self._speed_lock:
             self._greedy = bool(greedy)
+            self.speed_actor.set_greedy(self._greedy)
 
     def _infer_trajectory(self, request: _InferenceRequest) -> _ReadyTrajectory:
         with self._speed_lock:
@@ -266,6 +326,11 @@ class SpeedRLAgent(GR00TAgent):
     ) -> list[dict[str, NDArray[np.float64]]]:
         candidates = GR00TBimanualToppraAgent._response_to_action_candidates(response)
         horizons = tuple(len(next(iter(candidate.values()))) for candidate in candidates)
+        if any(horizon != self.policy_chunk_horizon for horizon in horizons):
+            raise ValueError(
+                "Speed-RL policy chunk horizon does not match the configured contract: "
+                f"expected={self.policy_chunk_horizon}, received={horizons}"
+            )
         context = self._feature_context
         if context is None:
             raise RuntimeError("Policy response arrived without a Speed-RL request context")
@@ -306,6 +371,8 @@ class SpeedRLAgent(GR00TAgent):
             if decision is not None and int(decision["episode_epoch"]) == self._episode_epoch:
                 decision["activation_index"] = len(self._activation_events)
                 decision["activated_monotonic_s"] = time.monotonic()
+                decision["executed_motion_s"] = 0.0
+                decision["executed_control_samples"] = 0
                 self._activation_events.append(decision)
                 self._activated_decision_count += 1
         elif self._ready_trajectory is None:
@@ -313,6 +380,28 @@ class SpeedRLAgent(GR00TAgent):
             if discarded is not None:
                 self._discarded_decision_count += 1
         return activated
+
+    def _pop_active_action_locked(self) -> dict[str, NDArray[Any]]:
+        action = super()._pop_active_action_locked()
+        if self._active_trajectory is None or self._active_last_sample is None:
+            return action
+        sequence_id = self._active_trajectory.sequence_id
+        event = next(
+            (
+                item
+                for item in reversed(self._activation_events)
+                if item.get("sequence_id") == sequence_id
+                and item.get("episode_epoch") == self._episode_epoch
+            ),
+            None,
+        )
+        if event is not None:
+            event["executed_control_samples"] = int(event["executed_control_samples"]) + 1
+            event["executed_motion_s"] = max(
+                float(event["executed_motion_s"]),
+                float(self._active_last_sample.time_from_start),
+            )
+        return action
 
     def finish_episode(self, outcome: EpisodeOutcome) -> list[Transition]:
         with self._cv:
@@ -335,21 +424,27 @@ class SpeedRLAgent(GR00TAgent):
         for index, event in enumerate(events):
             terminal = index == len(events) - 1
             next_event = events[index] if terminal else events[index + 1]
-            reward = float(event["speed_scale"]) ** 2 if outcome.safe_success else 0.0
-            transitions.append(
-                Transition(
-                    state=np.asarray(event["feature"], dtype=np.float32).copy(),
-                    action=int(event["action_index"]),
-                    reward=reward,
-                    next_state=np.asarray(next_event["feature"], dtype=np.float32).copy(),
-                    done=terminal,
-                    action_mask=np.asarray(event["action_mask"], dtype=np.bool_).copy(),
-                    next_action_mask=np.asarray(
-                        next_event["action_mask"],
-                        dtype=np.bool_,
-                    ).copy(),
-                )
+            reward, speed_reward, terminal_bonus, executed_30hz_steps = speedtuning_reward(
+                float(event["speed_scale"]),
+                float(event.get("executed_motion_s", 0.0)),
+                terminal=terminal,
+                safe_success=outcome.safe_success,
             )
+            if not outcome.control_fault:
+                transitions.append(
+                    Transition(
+                        state=np.asarray(event["feature"], dtype=np.float32).copy(),
+                        action=int(event["action_index"]),
+                        reward=reward,
+                        next_state=np.asarray(next_event["feature"], dtype=np.float32).copy(),
+                        done=terminal,
+                        action_mask=np.asarray(event["action_mask"], dtype=np.bool_).copy(),
+                        next_action_mask=np.asarray(
+                            next_event["action_mask"],
+                            dtype=np.bool_,
+                        ).copy(),
+                    )
+                )
             feature = np.asarray(event["feature"], dtype=np.float32)
             decision_records.append(
                 {
@@ -362,9 +457,13 @@ class SpeedRLAgent(GR00TAgent):
                     "feature_mean": float(np.mean(feature)),
                     "feature_std": float(np.std(feature)),
                     "feature_l2_norm": float(np.linalg.norm(feature)),
+                    "executed_30hz_steps": executed_30hz_steps,
+                    "speed_reward": speed_reward,
+                    "terminal_bonus": terminal_bonus,
                     "reward": reward,
                     "terminal": terminal,
                     "safe_success": outcome.safe_success,
+                    "excluded_from_replay": outcome.control_fault,
                 }
             )
         with self._cv:
@@ -448,6 +547,8 @@ class SpeedRLAgent(GR00TAgent):
             )
         values.update(
             {
+                "speed_rl_execution_backend": self.execution_backend,
+                "speed_rl_speed_values": self.speed_values,
                 "speed_rl_episode_epoch": self._episode_epoch,
                 "speed_rl_action_mask": action_mask.tolist(),
                 "speed_rl_fixed_action": fixed_action,
@@ -469,6 +570,7 @@ class SpeedRLAgent(GR00TAgent):
 
 def speed_planner_configs(
     base_config: BimanualToppraRolloutConfig,
+    speed_values: Sequence[float] = TOPPRA_SPEED_VALUES,
 ) -> tuple[BimanualToppraRolloutConfig, ...]:
     return tuple(
         replace(
@@ -476,5 +578,5 @@ def speed_planner_configs(
             left_limits=_limits_for_scale(scale),
             right_limits=_limits_for_scale(scale),
         )
-        for scale in SPEED_SCALES
+        for scale in validate_speed_values(speed_values)
     )

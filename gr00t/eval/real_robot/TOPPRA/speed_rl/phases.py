@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import SPEED_SCALES
+from .config import TOPPRA_SPEED_VALUES, validate_speed_values
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,9 @@ class EpisodeOutcome:
 
     @property
     def safe_success(self) -> bool:
-        return self.success and not self.abort and not self.speed_violation
+        return (
+            self.success and not self.abort and not self.speed_violation and not self.control_fault
+        )
 
     @property
     def valid_for_calibration(self) -> bool:
@@ -38,13 +40,24 @@ class CalibrationState:
 
 
 class CalibrationManager:
-    """Persist the ordered 0.7→1.0→1.3→1.6 two-episode calibration gate."""
+    """Persist an ordered, backend-specific, two-episode-per-speed calibration gate."""
 
-    def __init__(self, state_path: str | Path) -> None:
+    def __init__(
+        self,
+        state_path: str | Path,
+        speed_values: tuple[float, ...] = TOPPRA_SPEED_VALUES,
+    ) -> None:
         self.state_path = Path(state_path)
+        self.speed_values = validate_speed_values(speed_values)
         self.state = CalibrationState()
         if self.state_path.exists():
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            stored_speed_values = validate_speed_values(raw.pop("speed_values", ()))
+            if stored_speed_values != self.speed_values:
+                raise ValueError(
+                    "Calibration speed values do not match: "
+                    f"checkpoint={stored_speed_values}, runtime={self.speed_values}"
+                )
             self.state = CalibrationState(**raw)
 
     @property
@@ -60,7 +73,7 @@ class CalibrationManager:
     @property
     def speed_scale(self) -> float | None:
         action = self.fixed_action
-        return None if action is None else SPEED_SCALES[action]
+        return None if action is None else self.speed_values[action]
 
     def record_episode(self, outcome: EpisodeOutcome, transition_count: int) -> None:
         if self.state.complete:
@@ -68,7 +81,7 @@ class CalibrationManager:
         record = {
             **asdict(outcome),
             "speed_index": self.state.speed_index,
-            "speed_scale": SPEED_SCALES[self.state.speed_index],
+            "speed_scale": self.speed_values[self.state.speed_index],
             "transition_count": int(transition_count),
         }
         self.state.records.append(record)
@@ -91,23 +104,27 @@ class CalibrationManager:
         self.state.approvals.append(
             {
                 "speed_index": self.state.speed_index,
-                "speed_scale": SPEED_SCALES[self.state.speed_index],
+                "speed_scale": self.speed_values[self.state.speed_index],
                 "tracking_review": review,
             }
         )
         self.state.speed_index += 1
         self.state.valid_episodes_at_speed = 0
         self.state.awaiting_approval = False
-        if self.state.speed_index >= len(SPEED_SCALES):
+        if self.state.speed_index >= len(self.speed_values):
             self.state.complete = True
-            self.state.speed_index = len(SPEED_SCALES) - 1
+            self.state.speed_index = len(self.speed_values) - 1
         self._save()
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         temporary.write_text(
-            json.dumps(asdict(self.state), indent=2, sort_keys=True),
+            json.dumps(
+                {**asdict(self.state), "speed_values": list(self.speed_values)},
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         temporary.replace(self.state_path)
@@ -116,7 +133,7 @@ class CalibrationManager:
 class OnlineEpisodeBudget:
     def __init__(
         self,
-        maximum_episodes: int = 22,
+        maximum_episodes: int = 100,
         state_path: str | Path | None = None,
     ) -> None:
         if maximum_episodes < 1:

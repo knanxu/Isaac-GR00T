@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import importlib
 import json
+import logging
 import math
 import threading
 import time
@@ -13,6 +14,22 @@ import numpy as np
 
 CommandSink = Callable[[str], None]
 StatusProvider = Callable[[], Mapping[str, Any]]
+
+
+def restore_console_logging() -> logging.Handler:
+    """Restore one stderr handler after ``rospy.init_node`` replaces root handlers."""
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if getattr(handler, "_gr00t_console_handler", False):
+            return handler
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s"))
+    setattr(handler, "_gr00t_console_handler", True)
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    return handler
 
 
 def _json_ready(value: Any) -> Any:
@@ -48,7 +65,7 @@ class RosEpisodeBridge:
     250 Hz control thread, so a GUI callback can never configure or close Servo concurrently.
     """
 
-    COMMANDS = ("start", "success", "failure", "abort", "approve")
+    COMMANDS = ("start", "success", "failure", "abort", "reset", "ready", "approve")
 
     def __init__(
         self,

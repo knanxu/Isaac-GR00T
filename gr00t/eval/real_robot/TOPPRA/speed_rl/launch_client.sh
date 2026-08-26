@@ -41,6 +41,14 @@ if [[ -n "${ROBOT_ROS_SETUP:-}" ]]; then
     source "$ROBOT_ROS_SETUP"
 fi
 
+execution_backend="${EXECUTION_BACKEND:-toppra}"
+default_state_root="logs/kion_speed_rl/state"
+default_log_root="logs/kion_speed_rl/episodes"
+if [[ "${execution_backend}" == "interpolation" ]]; then
+    default_state_root="logs/kion_speed_rl_baseline/state"
+    default_log_root="logs/kion_speed_rl_baseline/episodes"
+fi
+
 command=(
     "$python_bin" -m gr00t.eval.real_robot.TOPPRA.speed_rl
     --server-host "$POLICY_SERVER_HOST"
@@ -48,9 +56,22 @@ command=(
     --timeout-ms "${TIMEOUT_MS:-15000}"
     --task "${TASK:-move parcel onto conveyor belt one by one}"
     --phase "${PHASE:-calibration}"
+    --execution-backend "${execution_backend}"
+    --baseline-action-frequency "${BASELINE_ACTION_FREQUENCY:-30}"
+    --baseline-k-skip "${BASELINE_K_SKIP:-10}"
+    --baseline-speed-min "${BASELINE_SPEED_MIN:-1.0}"
+    --baseline-speed-max "${BASELINE_SPEED_MAX:-4.0}"
+    --baseline-speed-step "${BASELINE_SPEED_STEP:-0.5}"
+    --toppra-speed-min "${TOPPRA_SPEED_MIN:-0.7}"
+    --toppra-speed-max "${TOPPRA_SPEED_MAX:-1.6}"
+    --toppra-speed-step "${TOPPRA_SPEED_STEP:-0.3}"
+    --policy-chunk-horizon "${POLICY_CHUNK_HORIZON:-40}"
+    --toppra-execution-horizon "${TOPPRA_EXECUTION_HORIZON:-30}"
+    --rainbow-hidden-dim "${RAINBOW_HIDDEN_DIM:-256}"
+    --online-episodes "${ONLINE_EPISODES:-100}"
     --inference-mode "${INFERENCE_MODE:-sync}"
-    --state-root "${STATE_ROOT:-logs/kion_speed_rl/state}"
-    --log-root "${LOG_ROOT:-logs/kion_speed_rl/episodes}"
+    --state-root "${STATE_ROOT:-${default_state_root}}"
+    --log-root "${LOG_ROOT:-${default_log_root}}"
     --control-frequency "${CONTROL_FREQUENCY:-250}"
     --policy-frequency "${POLICY_FREQUENCY:-30}"
     --refill-threshold "${REFILL_THRESHOLD:-20}"
@@ -69,12 +90,34 @@ command=(
     --control-interface "${CONTROL_INTERFACE:-gui}"
     --ros-namespace "${ROS_NAMESPACE:-/gr00t_rollout}"
     --pinch-max-rate-hz "${PINCH_MAX_RATE_HZ:-30}"
+    --reset-mode "${RESET_MODE:-manual}"
+    --reset-service "${RESET_SERVICE:-/zj_humanoid/upperlimb/go_home/dual_arm}"
+    --reset-timeout-s "${RESET_TIMEOUT_S:-10}"
     --left-camera-topic "${LEFT_CAMERA_TOPIC:-/zj_humanoid/sensor/left_wrist/image_raw/compressed}"
     --right-camera-topic "${RIGHT_CAMERA_TOPIC:-/zj_humanoid/sensor/right_wrist/image_raw/compressed}"
     --head-camera-topic "${HEAD_CAMERA_TOPIC:-/zj_humanoid/sensor/realsense_head/color/image_raw/compressed}"
     --left-twist-thresholds "$LEFT_TWIST_THRESHOLDS"
     --right-twist-thresholds "$RIGHT_TWIST_THRESHOLDS"
 )
+
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    : "${LEFT_WORKSPACE_BOUNDS:?set certified LEFT_WORKSPACE_BOUNDS for real motion}"
+    : "${RIGHT_WORKSPACE_BOUNDS:?set certified RIGHT_WORKSPACE_BOUNDS for real motion}"
+    : "${MAX_TARGET_POSITION_ERROR_M:?set certified MAX_TARGET_POSITION_ERROR_M for real motion}"
+    : "${MAX_TARGET_ROTATION_ERROR_RAD:?set certified MAX_TARGET_ROTATION_ERROR_RAD for real motion}"
+fi
+if [[ -n "${LEFT_WORKSPACE_BOUNDS:-}" ]]; then
+    command+=("--left-workspace-bounds=${LEFT_WORKSPACE_BOUNDS}")
+fi
+if [[ -n "${RIGHT_WORKSPACE_BOUNDS:-}" ]]; then
+    command+=("--right-workspace-bounds=${RIGHT_WORKSPACE_BOUNDS}")
+fi
+if [[ -n "${MAX_TARGET_POSITION_ERROR_M:-}" ]]; then
+    command+=(--max-target-position-error-m "${MAX_TARGET_POSITION_ERROR_M}")
+fi
+if [[ -n "${MAX_TARGET_ROTATION_ERROR_RAD:-}" ]]; then
+    command+=(--max-target-rotation-error-rad "${MAX_TARGET_ROTATION_ERROR_RAD}")
+fi
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     command+=(--dry-run)

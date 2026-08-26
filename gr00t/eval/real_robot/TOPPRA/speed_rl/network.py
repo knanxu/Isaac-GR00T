@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 import random
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as functional
 
 from .config import RainbowConfig
 
@@ -16,28 +18,106 @@ BoolArray = NDArray[np.bool_]
 FloatArray = NDArray[np.float32]
 
 
+class NoisyLinear(nn.Module):
+    """Factorized Gaussian NoisyNet layer used by the SpeedTuning Rainbow head."""
+
+    def __init__(self, in_features: int, out_features: int, std_init: float = 0.5) -> None:
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.std_init = float(std_init)
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self) -> None:
+        bound = 1.0 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.weight_mu, -bound, bound)
+        nn.init.constant_(self.weight_sigma, self.std_init / math.sqrt(self.in_features))
+        nn.init.uniform_(self.bias_mu, -bound, bound)
+        nn.init.constant_(self.bias_sigma, self.std_init / math.sqrt(self.out_features))
+
+    @staticmethod
+    def _scaled_noise(size: int, *, device: torch.device) -> Tensor:
+        values = torch.randn(size, device=device)
+        return values.sign() * values.abs().sqrt()
+
+    def reset_noise(self) -> None:
+        epsilon_in = self._scaled_noise(self.in_features, device=self.weight_epsilon.device)
+        epsilon_out = self._scaled_noise(self.out_features, device=self.weight_epsilon.device)
+        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, values: Tensor) -> Tensor:
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return functional.linear(values, weight, bias)
+
+
 class DuelingC51Network(nn.Module):
-    """Layer-normalized dueling categorical Q-network with one shared speed head."""
+    """SpeedTuning-compatible normalized dueling categorical Q-network."""
 
     def __init__(self, config: RainbowConfig) -> None:
         super().__init__()
         self.config = config
-        self.input_norm = nn.LayerNorm(config.feature_dim)
         self.backbone = nn.Sequential(
             nn.Linear(config.feature_dim, config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
         )
-        self.value = nn.Linear(config.hidden_dim, config.atom_count)
-        self.advantage = nn.Linear(
+        self.advantage_hidden = NoisyLinear(
+            config.hidden_dim,
+            config.hidden_dim,
+            config.noisy_std_init,
+        )
+        self.advantage = NoisyLinear(
             config.hidden_dim,
             config.action_count * config.atom_count,
+            config.noisy_std_init,
         )
+        self.value_hidden = NoisyLinear(
+            config.hidden_dim,
+            config.hidden_dim,
+            config.noisy_std_init,
+        )
+        self.value = NoisyLinear(config.hidden_dim, config.atom_count, config.noisy_std_init)
         self.register_buffer(
             "support",
             torch.linspace(config.support_min, config.support_max, config.atom_count),
         )
+        self.register_buffer("states_mean", torch.zeros(config.feature_dim))
+        self.register_buffer("states_std", torch.ones(config.feature_dim))
+
+    def update_norm_stats(self, mean: NDArray[Any], std: NDArray[Any]) -> None:
+        mean_tensor = torch.as_tensor(
+            mean, dtype=self.states_mean.dtype, device=self.states_mean.device
+        )
+        std_tensor = torch.as_tensor(
+            std, dtype=self.states_std.dtype, device=self.states_std.device
+        )
+        if mean_tensor.shape != self.states_mean.shape or std_tensor.shape != self.states_std.shape:
+            raise ValueError("normalization statistics do not match the feature dimension")
+        if torch.any(~torch.isfinite(mean_tensor)) or torch.any(~torch.isfinite(std_tensor)):
+            raise ValueError("normalization statistics must be finite")
+        self.states_mean.copy_(mean_tensor)
+        self.states_std.copy_(std_tensor.clamp_min(1e-6))
+
+    def reset_noise(self) -> None:
+        self.advantage_hidden.reset_noise()
+        self.advantage.reset_noise()
+        self.value_hidden.reset_noise()
+        self.value.reset_noise()
 
     def forward(self, features: Tensor) -> Tensor:
         if features.ndim != 2 or features.shape[-1] != self.config.feature_dim:
@@ -45,9 +125,12 @@ class DuelingC51Network(nn.Module):
                 f"features must have shape (batch, {self.config.feature_dim}), "
                 f"got {tuple(features.shape)}"
             )
-        hidden = self.backbone(self.input_norm(features))
-        value = self.value(hidden).view(-1, 1, self.config.atom_count)
-        advantage = self.advantage(hidden).view(
+        normalized = (features - self.states_mean) / self.states_std.clamp_min(1e-6)
+        hidden = self.backbone(normalized)
+        value_hidden = functional.relu(self.value_hidden(hidden))
+        advantage_hidden = functional.relu(self.advantage_hidden(hidden))
+        value = self.value(value_hidden).view(-1, 1, self.config.atom_count)
+        advantage = self.advantage(advantage_hidden).view(
             -1,
             self.config.action_count,
             self.config.atom_count,
@@ -55,7 +138,8 @@ class DuelingC51Network(nn.Module):
         return value + advantage - advantage.mean(dim=1, keepdim=True)
 
     def probabilities(self, features: Tensor) -> Tensor:
-        return torch.softmax(self(features), dim=-1)
+        probabilities = torch.softmax(self(features), dim=-1).clamp_min(1e-6)
+        return probabilities / probabilities.sum(dim=-1, keepdim=True)
 
     def q_values(self, features: Tensor) -> Tensor:
         return torch.sum(self.probabilities(features) * self.support, dim=-1)

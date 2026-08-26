@@ -13,24 +13,41 @@ from gr00t.eval.real_robot.TOPPRA.eval_toppra_bimanual import (
 )
 from gr00t.eval.real_robot.TOPPRA.kion_client.client import KionTopics
 from gr00t.eval.real_robot.TOPPRA.speed_rl import client as speed_rl_client
-from gr00t.eval.real_robot.TOPPRA.speed_rl.agent import SpeedRLAgent, speed_planner_configs
+from gr00t.eval.real_robot.TOPPRA.speed_rl.agent import (
+    SpeedRLAgent,
+    speed_planner_configs,
+    speedtuning_reward,
+)
 from gr00t.eval.real_robot.TOPPRA.speed_rl.baseline import verify_frozen_baseline
 from gr00t.eval.real_robot.TOPPRA.speed_rl.client import (
     EpisodeState,
     SpeedRLKionClient,
     _parse_args,
+    _speed_values_from_args,
     _validate_runtime_args,
 )
-from gr00t.eval.real_robot.TOPPRA.speed_rl.config import RainbowConfig
+from gr00t.eval.real_robot.TOPPRA.speed_rl.config import (
+    BASELINE_SPEED_VALUES,
+    TOPPRA_SPEED_VALUES,
+    RainbowConfig,
+    speed_grid,
+)
 from gr00t.eval.real_robot.TOPPRA.speed_rl.contract import (
     FeatureContract,
     extract_candidate_features,
     pool_candidate_feature,
     trim_candidate_features,
 )
+from gr00t.eval.real_robot.TOPPRA.speed_rl.interpolation import (
+    InterpolatedBimanualTrajectory,
+    InterpolationSpeedRLAgent,
+    accelerated_sample_phases,
+    resample_euler_delta_chunk,
+)
 from gr00t.eval.real_robot.TOPPRA.speed_rl.learner import LearnerProcess, RainbowLearner, SpeedActor
 from gr00t.eval.real_robot.TOPPRA.speed_rl.network import (
     DuelingC51Network,
+    NoisyLinear,
     project_categorical_distribution,
     select_masked_action,
 )
@@ -44,10 +61,12 @@ from gr00t.eval.real_robot.TOPPRA.speed_rl.replay import (
     PrioritizedReplayBuffer,
     Transition,
     build_n_step_transitions,
+    build_rainbow_replay_transitions,
 )
 from gr00t.eval.real_robot.TOPPRA.speed_rl.safety import SpeedViolationMonitor
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 import torch
 
 
@@ -118,14 +137,22 @@ def test_frozen_toppra_and_kion_baseline_hashes() -> None:
     assert len(verify_frozen_baseline()) == 7
 
 
-def test_dueling_c51_shape_layernorm_and_arbitrary_mask() -> None:
+def test_dueling_c51_shape_running_norm_noisy_heads_and_arbitrary_mask() -> None:
     config = RainbowConfig(feature_dim=FEATURE_DIM)
+    beta_1 = config.advance_beta(0.6, 1)
+    beta_2 = config.advance_beta(beta_1, 2)
+    assert beta_1 == pytest.approx(0.6 + 1e-5 * 0.4)
+    assert beta_2 == pytest.approx(beta_1 + 2e-5 * (1.0 - beta_1))
     network = DuelingC51Network(config)
     logits = network(torch.randn(3, FEATURE_DIM))
-    assert logits.shape == (3, 4, 51)
-    assert isinstance(network.input_norm, torch.nn.LayerNorm)
+    assert logits.shape == (3, 4, 121)
+    assert network.states_mean.shape == (FEATURE_DIM,)
+    assert network.states_std.shape == (FEATURE_DIM,)
     assert network.backbone[0].out_features == 256
     assert network.backbone[2].out_features == 256
+    assert network.backbone[4].out_features == 256
+    assert isinstance(network.advantage_hidden, NoisyLinear)
+    assert isinstance(network.value, NoisyLinear)
 
     action = select_masked_action(
         network,
@@ -173,8 +200,12 @@ def test_three_step_return_and_prioritized_replay_sampling() -> None:
     assert not n_step[0].done
     assert n_step[1].done
 
-    replay = PrioritizedReplayBuffer(16, alpha=0.6, seed=0)
-    replay.extend(n_step)
+    combined = build_rainbow_replay_transitions(episode, n_step=3, gamma=0.99)
+    assert combined[0].one_step.steps == 1
+    assert combined[0].n_step.steps == 3
+
+    replay = PrioritizedReplayBuffer(16, alpha=0.2, seed=0)
+    replay.extend(combined)
     replay.update_priorities(
         np.arange(4, dtype=np.int64),
         np.array([1.0, 1.0, 1.0, 100.0]),
@@ -220,7 +251,18 @@ def test_feature_contract_and_action_trim_stay_aligned() -> None:
         extract_candidate_features(bad_response, CONTRACT, (6, 6))
 
 
+def test_speedtuning_reward_keeps_speed_term_and_adds_strict_terminal_100() -> None:
+    failure = speedtuning_reward(4.0, 10.0 / 30.0, terminal=True, safe_success=False)
+    success = speedtuning_reward(4.0, 10.0 / 30.0, terminal=True, safe_success=True)
+    nonterminal = speedtuning_reward(4.0, 10.0 / 30.0, terminal=False, safe_success=True)
+    assert failure == pytest.approx((1.6, 1.6, 0.0, 10.0))
+    assert success == pytest.approx((101.6, 1.6, 100.0, 10.0))
+    assert nonterminal == pytest.approx(failure)
+
+
 def test_speed_planners_use_exact_unmargined_constraints() -> None:
+    assert speed_grid(0.7, 1.6, 0.3) == TOPPRA_SPEED_VALUES
+    assert speed_grid(1.0, 4.0, 0.5) == BASELINE_SPEED_VALUES
     base = BimanualToppraRolloutConfig(
         left_limits=_base_limits(),
         right_limits=_base_limits(),
@@ -236,6 +278,104 @@ def test_speed_planners_use_exact_unmargined_constraints() -> None:
             np.array([5.0, 5.0, 5.0, 15.0, 15.0, 15.0]) * scale**2,
         )
         assert config.left_limits.safety_margin == 1.0
+
+
+def _integrated_relative_path(actions: np.ndarray) -> tuple[np.ndarray, list[Rotation]]:
+    positions = []
+    rotations = []
+    position = np.zeros(3)
+    rotation = Rotation.identity()
+    for action in actions:
+        position = position + action[:3]
+        rotation = Rotation.from_euler("xyz", action[3:]) * rotation
+        positions.append(position.copy())
+        rotations.append(rotation)
+    return np.asarray(positions), rotations
+
+
+def _speedtuning_reference_resample(values: np.ndarray, speed: float) -> np.ndarray:
+    """Reference formula from SpeedTuning's public ``interpolate_action_chunk``."""
+
+    sample_times = np.arange(0.0, len(values), speed)
+    lower = np.floor(sample_times).astype(int)
+    upper = np.minimum(lower + 1, len(values) - 1)
+    fraction = (sample_times - lower)[:, None]
+    return values[lower] + fraction * (values[upper] - values[lower])
+
+
+def test_interpolation_baseline_resamples_incremental_euler_actions_in_se3() -> None:
+    actions = np.array(
+        [
+            [0.01, 0.00, 0.00, 0.10, -0.05, 0.20],
+            [0.00, 0.02, 0.00, -0.03, 0.04, 0.15],
+            [0.00, 0.00, 0.03, 0.02, 0.01, -0.10],
+        ],
+        dtype=np.float64,
+    )
+    resampled = resample_euler_delta_chunk(actions, 1.0)
+    original_positions, original_rotations = _integrated_relative_path(actions)
+    actual_positions, actual_rotations = _integrated_relative_path(resampled)
+    np.testing.assert_allclose(actual_positions, original_positions, atol=1e-12)
+    for actual, expected in zip(actual_rotations, original_rotations, strict=True):
+        assert np.linalg.norm((actual * expected.inv()).as_rotvec()) < 1e-12
+
+    accelerated = resample_euler_delta_chunk(actions, 1.5)
+    accelerated_positions, _ = _integrated_relative_path(accelerated)
+    np.testing.assert_allclose(
+        accelerated_positions,
+        _speedtuning_reference_resample(original_positions, 1.5),
+        atol=1e-12,
+    )
+
+    crossing = np.zeros((2, 6), dtype=np.float64)
+    crossing[:, 5] = np.deg2rad([170.0, 20.0])
+    slowed = resample_euler_delta_chunk(crossing, 0.5)
+    _, slowed_rotations = _integrated_relative_path(slowed)
+    assert np.linalg.norm(slowed_rotations[1].as_rotvec()) == pytest.approx(np.pi)
+    assert np.linalg.norm(slowed_rotations[-1].as_rotvec()) == pytest.approx(np.deg2rad(170.0))
+
+
+def test_interpolation_baseline_horizon_and_30hz_hold_semantics() -> None:
+    expected_horizons = {0.7: 58, 1.0: 40, 1.3: 31, 1.6: 25}
+    for speed, expected in expected_horizons.items():
+        phases = accelerated_sample_phases(40, speed)
+        assert len(phases) == expected
+        assert phases[0] == 1.0
+        assert phases[-1] == pytest.approx(min(1.0 + (expected - 1) * speed, 40.0))
+
+    receding_horizon = accelerated_sample_phases(40, 4.0, sample_count=10)
+    np.testing.assert_allclose(receding_horizon, 1.0 + np.arange(10) * 4.0)
+    with pytest.raises(ValueError, match="exceed"):
+        accelerated_sample_phases(40, 4.5, sample_count=10)
+
+    config = BimanualToppraRolloutConfig(
+        left_limits=_base_limits(),
+        right_limits=_base_limits(),
+    )
+    left = np.array(
+        [
+            [0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+            [0.2, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    trajectory = InterpolatedBimanualTrajectory(
+        config=config,
+        sequence_id=3,
+        target_poses={"left": left, "right": left.copy()},
+        auxiliary_actions={
+            config.left_pinch_key: np.zeros((2, 1)),
+            config.right_pinch_key: np.zeros((2, 1)),
+        },
+        action_frequency=30.0,
+        source_horizon=2,
+        speed_scale=1.0,
+        inference_started_at_s=0.0,
+        created_at_monotonic_s=0.0,
+    )
+    samples = trajectory.sample(np.array([0.0, 0.004, 0.032, 0.034, trajectory.duration]))
+    x = samples[config.left_pose_output_key][:, 0]
+    np.testing.assert_allclose(x, [0.1, 0.1, 0.1, 0.2, 0.2])
+    assert trajectory.duration == pytest.approx(2.0 / 30.0)
 
 
 def test_speed_violation_latches_on_frame_100_and_stale_masks_fast_actions() -> None:
@@ -275,6 +415,12 @@ def test_calibration_requires_two_valid_episodes_and_explicit_approval(tmp_path)
     with pytest.raises(RuntimeError, match="stopped"):
         _ = calibration.fixed_action
 
+    with pytest.raises(ValueError, match="speed values"):
+        CalibrationManager(
+            tmp_path / "calibration.json",
+            speed_values=BASELINE_SPEED_VALUES,
+        )
+
 
 def test_greedy_acceptance_persists_across_restarts(tmp_path) -> None:
     state_path = tmp_path / "greedy_sync.json"
@@ -287,6 +433,7 @@ def test_greedy_acceptance_persists_across_restarts(tmp_path) -> None:
 
 def test_async_runtime_gate_requires_raw_and_speed_rl_greedy_verification(tmp_path) -> None:
     common = [
+        "--dry-run",
         "--feature-dim",
         str(FEATURE_DIM),
         "--feature-model-id",
@@ -335,9 +482,63 @@ def test_async_runtime_gate_requires_raw_and_speed_rl_greedy_verification(tmp_pa
         )
 
 
+def test_interpolation_backend_has_isolated_defaults_and_sync_single_candidate_gate() -> None:
+    common = [
+        "--dry-run",
+        "--execution-backend",
+        "interpolation",
+        "--left-twist-thresholds",
+        "1,1,1,1,1,1",
+        "--right-twist-thresholds",
+        "1,1,1,1,1,1",
+    ]
+    args = _parse_args(common)
+    _validate_runtime_args(args)
+    assert args.state_root.as_posix() == "logs/kion_speed_rl_baseline/state"
+    assert args.log_root.as_posix() == "logs/kion_speed_rl_baseline/episodes"
+    assert args.baseline_k_skip == 10
+    assert args.policy_chunk_horizon == 40
+    assert _speed_values_from_args(args) == BASELINE_SPEED_VALUES
+
+    with pytest.raises(ValueError, match="sync only"):
+        _validate_runtime_args(_parse_args([*common, "--inference-mode", "async"]))
+    with pytest.raises(ValueError, match="tts-samples 1"):
+        _validate_runtime_args(_parse_args([*common, "--tts-samples", "4"]))
+    with pytest.raises(ValueError, match="exceed"):
+        _validate_runtime_args(_parse_args([*common, "--baseline-speed-max", "4.5"]))
+
+
+def test_real_motion_requires_explicit_cartesian_target_guard() -> None:
+    common = [
+        "--left-twist-thresholds",
+        "1,1,1,1,1,1",
+        "--right-twist-thresholds",
+        "1,1,1,1,1,1",
+    ]
+    with pytest.raises(ValueError, match="Real motion requires explicit"):
+        _validate_runtime_args(_parse_args(common))
+
+    _validate_runtime_args(
+        _parse_args(
+            [
+                *common,
+                "--left-workspace-bounds",
+                "0,1,-1,1,0,2",
+                "--right-workspace-bounds",
+                "0,1,-1,1,0,2",
+                "--max-target-position-error-m",
+                "0.1",
+                "--max-target-rotation-error-rad",
+                "0.2",
+            ]
+        )
+    )
+
+
 def test_server_contract_is_discovered_and_optional_cli_values_are_assertions(monkeypatch) -> None:
     args = _parse_args(
         [
+            "--dry-run",
             "--left-twist-thresholds",
             "1,1,1,1,1,1",
             "--right-twist-thresholds",
@@ -417,6 +618,26 @@ def test_synthetic_rainbow_training_converges_and_checkpoint_roundtrips(tmp_path
     with pytest.raises(ValueError, match="contract mismatch"):
         incompatible.load_checkpoint(path)
 
+    interpolation = RainbowLearner(
+        RainbowConfig(
+            feature_dim=FEATURE_DIM,
+            action_count=len(BASELINE_SPEED_VALUES),
+            support_max=500.0,
+        ),
+        CONTRACT,
+        execution_backend="interpolation",
+    )
+    with pytest.raises(ValueError, match="execution backend"):
+        interpolation.load_checkpoint(path)
+
+    changed_speeds = RainbowLearner(
+        config,
+        CONTRACT,
+        speed_values=(0.8, 1.1, 1.4, 1.7),
+    )
+    with pytest.raises(ValueError, match="speed values"):
+        changed_speeds.load_checkpoint(path)
+
 
 @pytest.mark.serial
 def test_spawn_learner_process_replay_and_checkpoint(tmp_path) -> None:
@@ -444,7 +665,7 @@ class _DelayedFeaturePolicy:
         del observation, options
         self.started.set()
         time.sleep(self.delay_s)
-        horizon = 12
+        horizon = 40
         left = np.zeros((1, horizon, 6), dtype=np.float32)
         right = np.zeros_like(left)
         left[..., 0] = 0.003
@@ -520,6 +741,10 @@ def test_fake_server_latency_keeps_act_below_control_budget(delay_s: float) -> N
         assert np.percentile(durations_ms, 99) < 1.0
         assert max(durations_ms) < 4.0
         assert len(agent.trajectory_decisions) == 1
+        pending_decision = next(iter(agent.trajectory_decisions.values()))
+        assert pending_decision["source_horizon"] == 40
+        assert pending_decision["execution_horizon"] == 30
+        assert pending_decision["discarded_source_actions"] == 10
         assert agent.diagnostics()["speed_rl_activated_decisions"] == 0
 
         agent.act(observation)
@@ -530,10 +755,82 @@ def test_fake_server_latency_keeps_act_below_control_budget(delay_s: float) -> N
         assert len(records) == 1
         assert "feature" not in records[0]
         assert records[0]["sequence_id"] == agent.diagnostics()["active_sequence_id"]
-        assert any(
-            transitions[0].reward == pytest.approx(expected)
-            for expected in (0.7**2, 1.0, 1.3**2, 1.6**2)
-        )
+        assert transitions[0].reward == pytest.approx(100.0)
+        assert records[0]["terminal_bonus"] == 100.0
+    finally:
+        agent.teardown()
+
+
+def test_interpolation_agent_reuses_speed_rl_transition_lifecycle() -> None:
+    policy = _DelayedFeaturePolicy(0.01)
+    actor = SpeedActor(
+        RainbowConfig(
+            feature_dim=FEATURE_DIM,
+            action_count=len(BASELINE_SPEED_VALUES),
+            support_max=500.0,
+        ),
+        seed=0,
+    )
+    agent = InterpolationSpeedRLAgent(
+        policy_client=policy,
+        feature_contract=CONTRACT,
+        speed_actor=actor,
+        inference_mode="sync",
+        tts_samples=1,
+        left_limits=_base_limits(),
+        right_limits=_base_limits(),
+        baseline_action_frequency=30.0,
+    )
+    agent.set_fixed_action(6)
+    try:
+        agent.act(_observation())
+        _wait_for_generation(agent, 1)
+        decision = next(iter(agent.trajectory_decisions.values()))
+        assert decision["execution_backend"] == "interpolation"
+        assert decision["source_horizon"] == 40
+        assert decision["resampled_horizon"] == 10
+        assert decision["execution_horizon"] == 10
+        assert decision["full_resampled_horizon"] == 10
+        assert decision["last_source_action_index"] == 36.0
+        assert decision["action_frequency_hz"] == 30.0
+
+        agent.act(_observation())
+        while agent.diagnostics()["active_buffer_size"]:
+            agent.act(_observation())
+        diagnostics = agent.diagnostics()
+        assert diagnostics["speed_rl_execution_backend"] == "interpolation"
+        assert diagnostics["speed_rl_activated_decisions"] == 1
+        transitions = agent.finish_episode(EpisodeOutcome(success=True))
+        assert len(transitions) == 1
+        assert transitions[0].action == 6
+        assert transitions[0].reward == pytest.approx(101.6)
+        record = agent.last_episode_decisions()[0]
+        assert record["executed_30hz_steps"] == pytest.approx(10.0)
+        assert record["speed_reward"] == pytest.approx(1.6)
+        assert record["terminal_bonus"] == 100.0
+    finally:
+        agent.teardown()
+
+
+def test_control_fault_episode_is_logged_but_excluded_from_replay() -> None:
+    policy = _DelayedFeaturePolicy(0.01)
+    actor = SpeedActor(RainbowConfig(feature_dim=FEATURE_DIM), seed=0)
+    agent = SpeedRLAgent(
+        policy_client=policy,
+        feature_contract=CONTRACT,
+        speed_actor=actor,
+        inference_mode="sync",
+        tts_samples=1,
+        left_limits=_base_limits(),
+        right_limits=_base_limits(),
+    )
+    try:
+        agent.act(_observation())
+        _wait_for_generation(agent, 1)
+        agent.act(_observation())
+        transitions = agent.finish_episode(EpisodeOutcome(success=False, control_fault=True))
+        assert transitions == []
+        assert agent.last_episode_decisions()[0]["excluded_from_replay"] is True
     finally:
         agent.teardown()
 
@@ -603,6 +900,7 @@ def test_greedy_client_persists_labeled_episode_without_mutating_replay(
         def __init__(self) -> None:
             self.config = SimpleNamespace(inference_mode="sync")
             self.feature_contract = CONTRACT
+            self.speed_values = TOPPRA_SPEED_VALUES
             self.fixed_action = None
             self.greedy = False
             self.action_mask = None
@@ -665,7 +963,7 @@ def test_greedy_client_persists_labeled_episode_without_mutating_replay(
         task="parcel",
         dry_run=True,
     )
-    client._online_budget.completed_episodes = 22
+    client._online_budget.completed_episodes = 100
     client._twist_stale = False
     client._start_episode()
     assert client.state is EpisodeState.RUNNING
@@ -687,6 +985,12 @@ def test_greedy_client_persists_labeled_episode_without_mutating_replay(
         ]
         == 1
     )
+    with pytest.raises(RuntimeError, match="finish and reset first"):
+        client._start_episode()
+    client._begin_reset()
+    assert client.state is EpisodeState.RESETTING
+    client._confirm_reset_ready()
+    assert client.state is EpisodeState.IDLE
     client.close()
 
 

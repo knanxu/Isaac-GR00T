@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> None:
         prog="python -m gr00t.eval.real_robot.TOPPRA.rollout",
         description="Unified bimanual real-robot rollout entrypoint.",
     )
-    parser.add_argument("mode", choices=("plain", "speed-rl"))
+    parser.add_argument("mode", choices=("plain", "speed-rl", "speed-rl-baseline"))
     if not values or values[0] in {"-h", "--help"}:
         parser.print_help()
         return
@@ -23,6 +23,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     from ..speed_rl.client import main as speed_rl_main
 
+    if mode == "speed-rl-baseline":
+        forwarded = ["--execution-backend", "interpolation", *forwarded]
     speed_rl_main(forwarded)
 
 

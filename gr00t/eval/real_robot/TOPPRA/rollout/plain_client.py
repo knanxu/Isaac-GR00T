@@ -29,9 +29,16 @@ from ..kion_client.client import (
     load_ros_types,
 )
 from ..kion_client.tracking import TrackingRecorder, make_tracking_row
+from .hardware_safety import (
+    TargetSafetyError,
+    TargetSafetyGuard,
+    parse_workspace_bounds,
+    require_real_policy_cameras,
+)
 from .observation import RolloutObservationBuffer, policy_observation, rollout_staleness
-from .operator import RosEpisodeBridge
+from .operator import RosEpisodeBridge, restore_console_logging
 from .pinch import KionPinchExecutor
+from .reset import DUAL_ARM_HOME_SERVICE, EpisodeResetController
 
 
 LOGGER = logging.getLogger(__name__)
@@ -44,6 +51,7 @@ class EpisodeState(str, Enum):
     RUNNING = "running"
     TERMINATED = "terminated"
     ABORTED = "aborted"
+    RESETTING = "resetting"
     CLOSED = "closed"
 
 
@@ -65,11 +73,15 @@ class PlainKionEpisodeClient:
         task: str,
         inference_mode: str,
         dry_run: bool,
+        target_safety: TargetSafetyGuard | None = None,
         episode_duration_s: float = 80.0,
         control_interface: str = "gui",
         ros_namespace: str = "/gr00t_rollout",
         pinch_enabled: bool = True,
         pinch_max_rate_hz: float = 30.0,
+        reset_mode: str = "manual",
+        reset_service: str = DUAL_ARM_HOME_SERVICE,
+        reset_timeout_s: float = 10.0,
     ) -> None:
         self.ros_types = ros_types
         self.rospy = ros_types.rospy
@@ -85,11 +97,21 @@ class PlainKionEpisodeClient:
         self.task = task
         self.inference_mode = inference_mode
         self.dry_run = bool(dry_run)
+        if not self.dry_run and target_safety is None:
+            raise ValueError("Real motion requires a TargetSafetyGuard")
+        self.target_safety = target_safety
         self.episode_duration_s = float(episode_duration_s)
         self.control_interface = control_interface
         self.ros_namespace = ros_namespace
         self.pinch_enabled = bool(pinch_enabled)
         self.pinch_max_rate_hz = float(pinch_max_rate_hz)
+        self.reset_controller = EpisodeResetController(
+            self.rospy,
+            mode=reset_mode,
+            service_name=reset_service,
+            service_timeout_s=reset_timeout_s,
+            dry_run=self.dry_run,
+        )
 
         self.observations = RolloutObservationBuffer(ros_types, topics)
         self.agent: GR00TAgent | None = None
@@ -114,6 +136,7 @@ class PlainKionEpisodeClient:
         self._stale_fields: tuple[str, ...] = ()
         self._critical_stale_fields: tuple[str, ...] = ()
         self._twist_stale = True
+        self._hardware_safety_error: str | None = None
 
     def enqueue_command(self, command: str) -> None:
         self._commands.put(command)
@@ -204,6 +227,22 @@ class PlainKionEpisodeClient:
                     )
                     target_left = np.asarray(action[LEFT_TARGET_KEY], dtype=np.float64)
                     target_right = np.asarray(action[RIGHT_TARGET_KEY], dtype=np.float64)
+                    if self.target_safety is not None:
+                        try:
+                            self.target_safety.validate(
+                                target_left,
+                                target_right,
+                                snapshot.left_pose,
+                                snapshot.right_pose,
+                            )
+                        except TargetSafetyError as exc:
+                            self._hardware_safety_error = str(exc)
+                            LOGGER.error("Hardware target safety abort: %s", exc)
+                            self._abort_episode(reason=f"target safety: {exc}")
+                            target_left = None
+                            target_right = None
+                            diagnostics["execution_state"] = "target_safety_abort"
+                            continue
                     self._last_target = {
                         "left": target_left.copy(),
                         "right": target_right.copy(),
@@ -313,6 +352,10 @@ class PlainKionEpisodeClient:
             self._finish_episode(success=False, reason="operator failure")
         elif command == "abort":
             self._abort_episode(reason="operator abort")
+        elif command == "reset":
+            self._begin_reset()
+        elif command == "ready":
+            self._confirm_reset_ready()
         elif command == "approve":
             raise RuntimeError("approve is only available in Speed-RL calibration")
         elif command == "status":
@@ -326,8 +369,10 @@ class PlainKionEpisodeClient:
         return self.status()
 
     def _start_episode(self) -> None:
-        if self.state == EpisodeState.RUNNING:
-            raise RuntimeError("An episode is already running")
+        if self.state != EpisodeState.IDLE:
+            raise RuntimeError(
+                f"Start requires IDLE state, got {self.state.value}; finish and reset first"
+            )
         if self._finalizer is not None and self._finalizer.is_alive():
             raise RuntimeError("The previous episode is still finalizing")
         if self._finalization_error is not None:
@@ -338,6 +383,11 @@ class PlainKionEpisodeClient:
             raise RuntimeError(
                 "Cannot start while required rollout observations are stale: "
                 + ", ".join(self._critical_stale_fields)
+            )
+        if not self.dry_run:
+            require_real_policy_cameras(
+                self.rospy,
+                (self.topics.left_camera, self.topics.right_camera, self.topics.head_camera),
             )
 
         self._close_episode_resources()
@@ -405,6 +455,7 @@ class PlainKionEpisodeClient:
         self._last_target = None
         self._last_outcome = None
         self._last_safe_success = None
+        self._hardware_safety_error = None
         self._episode_started_s = time.monotonic()
         self.state = EpisodeState.RUNNING
         LOGGER.info(
@@ -412,6 +463,46 @@ class PlainKionEpisodeClient:
             self.episode_number,
             self.inference_mode,
         )
+
+    def _begin_reset(self) -> None:
+        if self.state not in {
+            EpisodeState.TERMINATED,
+            EpisodeState.ABORTED,
+            EpisodeState.RESETTING,
+        }:
+            raise RuntimeError("Reset requires a finished or aborted episode")
+        if self._finalizer is not None and self._finalizer.is_alive():
+            raise RuntimeError("The episode is still finalizing; wait before reset")
+        if self._finalization_error is not None:
+            raise RuntimeError(f"Episode finalization failed: {self._finalization_error}")
+        self._close_motion_resources()
+        if self.agent is not None:
+            self.agent.teardown()
+            self.agent = None
+        self._last_target = None
+        self._episode_started_s = None
+        self.reset_controller.begin()
+        self.state = EpisodeState.RESETTING
+        LOGGER.warning(
+            "Servo control released for reset (mode=%s). Confirm robot and scene reset, then "
+            "issue 'ready'.",
+            self.reset_controller.mode,
+        )
+
+    def _confirm_reset_ready(self) -> None:
+        if self.state != EpisodeState.RESETTING:
+            raise RuntimeError("Ready requires RESETTING state")
+        reset_status = self.reset_controller.status()
+        if not reset_status.operator_may_confirm_ready:
+            detail = reset_status.error or "dual-arm home request is still in progress"
+            raise RuntimeError(f"Reset cannot be confirmed ready: {detail}")
+        if self._critical_stale_fields:
+            raise RuntimeError(
+                "Cannot confirm reset while required observations are stale: "
+                + ", ".join(self._critical_stale_fields)
+            )
+        self.state = EpisodeState.IDLE
+        LOGGER.info("Operator confirmed robot and scene reset; the next episode may start")
 
     def _finish_episode(
         self,
@@ -490,6 +581,7 @@ class PlainKionEpisodeClient:
 
     def status(self) -> dict[str, Any]:
         diagnostics = {} if self.agent is None else self.agent.diagnostics()
+        reset_status = self.reset_controller.status()
         return {
             "state": self.state.value,
             "mode": "plain",
@@ -511,6 +603,7 @@ class PlainKionEpisodeClient:
             "speed_action": None,
             "speed_scale": None,
             "speed_violation": False,
+            "hardware_safety_error": self._hardware_safety_error,
             "twist_stale": self._twist_stale,
             "stale_fields": self._stale_fields,
             "critical_stale_fields": self._critical_stale_fields,
@@ -521,6 +614,7 @@ class PlainKionEpisodeClient:
                 self._finalizer is not None and self._finalizer.is_alive()
             ),
             "finalization_error": self._finalization_error,
+            "reset": reset_status.to_dict(),
         }
 
     def _close_motion_resources(self) -> None:
@@ -554,6 +648,7 @@ class PlainKionEpisodeClient:
         if self.agent is not None:
             self.agent.teardown()
             self.agent = None
+        self.reset_controller.wait(0.1)
         self.observations.close()
         self.state = EpisodeState.CLOSED
 
@@ -605,9 +700,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ros-namespace", default="/gr00t_rollout")
     parser.add_argument("--disable-pinch", action="store_true")
     parser.add_argument("--pinch-max-rate-hz", type=_positive_float, default=30.0)
+    parser.add_argument("--reset-mode", choices=("manual", "go-home"), default="manual")
+    parser.add_argument("--reset-service", default=DUAL_ARM_HOME_SERVICE)
+    parser.add_argument("--reset-timeout-s", type=_positive_float, default=10.0)
     parser.add_argument("--left-camera-topic", default=KionTopics.left_camera)
     parser.add_argument("--right-camera-topic", default=KionTopics.right_camera)
     parser.add_argument("--head-camera-topic", default=KionTopics.head_camera)
+    parser.add_argument("--left-workspace-bounds")
+    parser.add_argument("--right-workspace-bounds")
+    parser.add_argument("--max-target-position-error-m", type=_positive_float)
+    parser.add_argument("--max-target-rotation-error-rad", type=_positive_float)
     return parser.parse_args(argv)
 
 
@@ -617,6 +719,18 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--servo-gain must be in the SDK range [100, 1000]")
     if not 0 < args.safety_margin <= 1:
         raise ValueError("--safety-margin must be in (0, 1]")
+    target_guard_args = (
+        args.left_workspace_bounds,
+        args.right_workspace_bounds,
+        args.max_target_position_error_m,
+        args.max_target_rotation_error_rad,
+    )
+    if not args.dry_run and any(value is None for value in target_guard_args):
+        raise ValueError(
+            "Real motion requires explicit --left-workspace-bounds, "
+            "--right-workspace-bounds, --max-target-position-error-m, and "
+            "--max-target-rotation-error-rad"
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
@@ -629,6 +743,7 @@ def main(argv: list[str] | None = None) -> None:
     LOGGER.info("Policy server preflight passed: %s:%d", args.server_host, args.server_port)
     ros_types = load_ros_types()
     ros_types.rospy.init_node(args.node_name, disable_signals=False)
+    restore_console_logging()
     topics = KionTopics(
         left_camera=args.left_camera_topic,
         right_camera=args.right_camera_topic,
@@ -641,6 +756,18 @@ def main(argv: list[str] | None = None) -> None:
         max_angular_acceleration=(args.max_angular_acceleration,) * 3,
         safety_margin=args.safety_margin,
     )
+    target_safety = None
+    if args.left_workspace_bounds is not None or args.right_workspace_bounds is not None:
+        if args.left_workspace_bounds is None or args.right_workspace_bounds is None:
+            raise ValueError("Both left and right workspace bounds must be supplied together")
+        if args.max_target_position_error_m is None or args.max_target_rotation_error_rad is None:
+            raise ValueError("Workspace bounds require both target tracking error limits")
+        target_safety = TargetSafetyGuard(
+            parse_workspace_bounds(args.left_workspace_bounds),
+            parse_workspace_bounds(args.right_workspace_bounds),
+            max_position_error_m=args.max_target_position_error_m,
+            max_rotation_error_rad=args.max_target_rotation_error_rad,
+        )
 
     def agent_factory() -> GR00TAgent:
         return GR00TAgent(
@@ -679,10 +806,14 @@ def main(argv: list[str] | None = None) -> None:
         task=args.task,
         inference_mode=args.inference_mode,
         dry_run=args.dry_run,
+        target_safety=target_safety,
         episode_duration_s=args.episode_duration_s,
         control_interface=args.control_interface,
         ros_namespace=args.ros_namespace,
         pinch_enabled=not args.disable_pinch,
         pinch_max_rate_hz=args.pinch_max_rate_hz,
+        reset_mode=args.reset_mode,
+        reset_service=args.reset_service,
+        reset_timeout_s=args.reset_timeout_s,
     )
     client.run()

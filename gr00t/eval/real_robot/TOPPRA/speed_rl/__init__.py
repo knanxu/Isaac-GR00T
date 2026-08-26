@@ -1,7 +1,13 @@
 """Independent speed selection with Rainbow-DQN for the bimanual TOPPRA rollout."""
 
-from .config import SPEED_SCALES, RainbowConfig
+from .config import BASELINE_SPEED_VALUES, SPEED_SCALES, TOPPRA_SPEED_VALUES, RainbowConfig
 from .contract import FeatureContract
 
 
-__all__ = ["FeatureContract", "RainbowConfig", "SPEED_SCALES"]
+__all__ = [
+    "BASELINE_SPEED_VALUES",
+    "FeatureContract",
+    "RainbowConfig",
+    "SPEED_SCALES",
+    "TOPPRA_SPEED_VALUES",
+]

@@ -125,6 +125,19 @@ class RolloutControlPanel(GUIModule):
                 tag="rollout_abort",
                 callback=lambda: self._enqueue("abort"),
             )
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Reset / Release Servo",
+                height=50,
+                tag="rollout_reset",
+                callback=lambda: self._enqueue("reset"),
+            )
+            dpg.add_button(
+                label="Reset Complete / Ready",
+                height=50,
+                tag="rollout_ready",
+                callback=lambda: self._enqueue("ready"),
+            )
             dpg.add_button(
                 label="Approve Calibrated Speed",
                 height=60,
@@ -135,6 +148,7 @@ class RolloutControlPanel(GUIModule):
         dpg.add_text("Trajectory: ---", tag="rollout_trajectory_text")
         dpg.add_text("Speed-RL: ---", tag="rollout_speed_text")
         dpg.add_text("Safety: ---", tag="rollout_safety_text")
+        dpg.add_text("Reset: ---", tag="rollout_reset_text")
         dpg.add_text("Dataset: idle", tag="rollout_dataset_text")
         dpg.add_text(self._last_result, tag="rollout_command_text", wrap=1800)
 
@@ -156,6 +170,7 @@ class RolloutControlPanel(GUIModule):
         finalizing = bool(status.get("finalization_in_progress", False))
         mode = status.get("mode", "---")
         phase = status.get("phase")
+        reset = status.get("reset") or {}
         stale_label = "no status" if age_s is None else f"status age {age_s:.1f}s"
 
         dpg.set_value(
@@ -191,13 +206,27 @@ class RolloutControlPanel(GUIModule):
         dpg.set_value(
             "rollout_safety_text",
             "Safety: violation={} | twist_stale={} | critical_stale={} | mask={} | "
-            "outcome={} | safe_success={}".format(
+            "target_guard={} | outcome={} | safe_success={}".format(
                 status.get("speed_violation", False),
                 status.get("twist_stale", "---"),
                 status.get("critical_stale_fields", "---"),
                 status.get("action_mask", "---"),
+                status.get("hardware_safety_error") or "clear",
                 status.get("last_outcome", "---"),
                 status.get("last_safe_success", "---"),
+            ),
+        )
+        dpg.set_value(
+            "rollout_reset_text",
+            "Reset: mode={} | home_request={} | operator_ready={} | error={}".format(
+                reset.get("mode", "---"),
+                (
+                    "running"
+                    if reset.get("home_request_in_progress")
+                    else ("complete" if reset.get("home_request_complete") else "not-started")
+                ),
+                reset.get("operator_may_confirm_ready", False),
+                reset.get("error") or "none",
             ),
         )
         recording_mode = (
@@ -216,15 +245,27 @@ class RolloutControlPanel(GUIModule):
         )
         dpg.configure_item(
             "rollout_start",
-            enabled=not running and not finalizing and not start_blocked,
+            enabled=state == "idle" and not finalizing and not start_blocked,
         )
         dpg.configure_item("rollout_success", enabled=running)
         dpg.configure_item("rollout_failure", enabled=running)
         dpg.configure_item("rollout_abort", enabled=running)
+        dpg.configure_item(
+            "rollout_reset",
+            enabled=state in {"terminated", "aborted", "resetting"} and not finalizing,
+        )
+        dpg.configure_item(
+            "rollout_ready",
+            enabled=state == "resetting"
+            and bool(reset.get("operator_may_confirm_ready"))
+            and not bool(status.get("critical_stale_fields")),
+        )
         awaiting_approval = bool((status.get("calibration") or {}).get("awaiting_approval"))
         dpg.configure_item(
             "rollout_approve",
-            enabled=mode == "speed-rl" and awaiting_approval and not running,
+            enabled=(mode in {"speed-rl", "speed-rl-baseline"})
+            and awaiting_approval
+            and not running,
         )
 
     def _sync_passive_recording(self, status: dict[str, Any]) -> None:
@@ -244,14 +285,19 @@ class RolloutControlPanel(GUIModule):
             self._recording_episode = episode
             self._last_result = f"Recording external rollout episode {episode}"
             return
-        if self._recording_episode != episode or state not in {"terminated", "aborted"}:
+        if self._recording_episode != episode or state not in {
+            "terminated",
+            "aborted",
+            "resetting",
+            "idle",
+        }:
             return
 
         outcome = status.get("last_outcome")
-        if state == "terminated" and outcome not in {"success", "failure"}:
+        if outcome not in {"success", "failure", "abort"}:
             return
         self._control_state.set_mode(Mode.REVIEWING)
-        if state == "aborted":
+        if outcome == "abort":
             self._control_loop.discard_episode()
             self._last_result = f"Discarded aborted rollout episode {episode}"
         else:

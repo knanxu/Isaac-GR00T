@@ -1,24 +1,50 @@
 # ruff: noqa: E402
+import importlib
+import sys
+import types
 import warnings
 
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 warnings.filterwarnings("ignore", message="Gym has been unmaintained")
 
+
+def _install_ros_sdk_namespace_compatibility() -> None:
+    """Expose the locally installed flat ROS packages under the SDK's nested namespace."""
+
+    try:
+        importlib.import_module("zj_humanoid.upperlimb.msg")
+        importlib.import_module("zj_humanoid.hand.msg")
+        return
+    except ModuleNotFoundError:
+        pass
+
+    root = sys.modules.get("zj_humanoid")
+    if root is None:
+        root = types.ModuleType("zj_humanoid")
+        root.__path__ = []
+        sys.modules["zj_humanoid"] = root
+    for package_name in ("upperlimb", "hand"):
+        package = importlib.import_module(package_name)
+        setattr(root, package_name, package)
+        sys.modules[f"zj_humanoid.{package_name}"] = package
+        for child_name in ("msg", "srv"):
+            child = importlib.import_module(f"{package_name}.{child_name}")
+            sys.modules[f"zj_humanoid.{package_name}.{child_name}"] = child
+
+
+_install_ros_sdk_namespace_compatibility()
+
 from agents.lerobuffer import LeroBuffer
 from agents.rollout_passive import PassiveRolloutAgent
 from gui import ObservationGUI
 from gui.rollout_control import RolloutControlPanel
 from observations import (
-    LeftDeltaTCP,
     LeftFingerPressure,
     LeftTCP,
     LeftWristForce,
     ObservationController,
     ParcelCamera,
-    ParcelLeftPinch,
-    ParcelRightPinch,
-    RightDeltaTCP,
     RightFingerPressure,
     RightTCP,
     RightWristForce,
@@ -44,12 +70,8 @@ def main() -> None:
             ),
             LeftTCP(),
             RightTCP(),
-            LeftDeltaTCP(),
-            RightDeltaTCP(),
             LeftFingerPressure(),
             RightFingerPressure(),
-            ParcelLeftPinch(visible=False),
-            ParcelRightPinch(visible=False),
             LeftWristForce(deadzone=10),
             RightWristForce(deadzone=10),
         ]

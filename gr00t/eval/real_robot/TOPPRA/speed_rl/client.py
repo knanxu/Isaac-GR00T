@@ -29,12 +29,20 @@ from ..kion_client.client import (
     load_ros_types,
 )
 from ..kion_client.tracking import TrackingRecorder, make_tracking_row
+from ..rollout.hardware_safety import (
+    TargetSafetyError,
+    TargetSafetyGuard,
+    parse_workspace_bounds,
+    require_real_policy_cameras,
+)
 from ..rollout.observation import RolloutObservationBuffer, policy_observation, rollout_staleness
-from ..rollout.operator import RosEpisodeBridge
+from ..rollout.operator import RosEpisodeBridge, restore_console_logging
 from ..rollout.pinch import KionPinchExecutor
+from ..rollout.reset import DUAL_ARM_HOME_SERVICE, EpisodeResetController
 from .agent import SpeedRLAgent
-from .config import RainbowConfig, epsilon_for_decisions
+from .config import RainbowConfig, epsilon_for_decisions, speed_grid
 from .contract import FeatureContract
+from .interpolation import InterpolationSpeedRLAgent
 from .learner import LearnerProcess, SpeedActor
 from .phases import CalibrationManager, EpisodeOutcome, GreedyAcceptance, OnlineEpisodeBudget
 from .replay import Transition
@@ -51,6 +59,7 @@ class EpisodeState(str, Enum):
     RUNNING = "running"
     TERMINATED = "terminated"
     ABORTED = "aborted"
+    RESETTING = "resetting"
     CLOSED = "closed"
 
 
@@ -77,16 +86,22 @@ class SpeedRLKionClient:
         max_image_age_s: float,
         task: str,
         dry_run: bool,
+        target_safety: TargetSafetyGuard | None = None,
         episode_duration_s: float = 80.0,
         control_interface: str = "gui",
         ros_namespace: str = "/gr00t_rollout",
         pinch_enabled: bool = True,
         pinch_max_rate_hz: float = 30.0,
+        online_episodes: int = 100,
+        reset_mode: str = "manual",
+        reset_service: str = DUAL_ARM_HOME_SERVICE,
+        reset_timeout_s: float = 10.0,
     ) -> None:
         self.ros_types = ros_types
         self.rospy = ros_types.rospy
         self.topics = topics
         self.agent = agent
+        self.execution_backend = getattr(agent, "execution_backend", "toppra")
         self.actor = actor
         self.learner = learner
         self.safety = safety
@@ -102,11 +117,24 @@ class SpeedRLKionClient:
         self.max_image_age_s = float(max_image_age_s)
         self.task = task
         self.dry_run = bool(dry_run)
+        if not self.dry_run and target_safety is None:
+            raise ValueError("Real motion requires a TargetSafetyGuard")
+        self.target_safety = target_safety
         self.episode_duration_s = float(episode_duration_s)
         self.control_interface = control_interface
         self.ros_namespace = ros_namespace
         self.pinch_enabled = bool(pinch_enabled)
         self.pinch_max_rate_hz = float(pinch_max_rate_hz)
+        self.online_episodes = int(online_episodes)
+        if self.online_episodes < 1:
+            raise ValueError("online_episodes must be positive")
+        self.reset_controller = EpisodeResetController(
+            self.rospy,
+            mode=reset_mode,
+            service_name=reset_service,
+            service_timeout_s=reset_timeout_s,
+            dry_run=self.dry_run,
+        )
         self.servo: KionDualArmServo | None = None
         self.pinch: KionPinchExecutor | None = None
         self.recorder: TrackingRecorder | None = None
@@ -128,10 +156,11 @@ class SpeedRLKionClient:
         self._stale_fields: tuple[str, ...] = ()
         self._critical_stale_fields: tuple[str, ...] = ()
         self._twist_stale = True
+        self._hardware_safety_error: str | None = None
         self._learner_stats_lock = threading.Lock()
         self._learner_stats = self.learner.stats()
         self._online_budget = OnlineEpisodeBudget(
-            22,
+            self.online_episodes,
             calibration.state_path.parent / "online_budget.json",
         )
         self._greedy_acceptance = GreedyAcceptance(
@@ -194,7 +223,7 @@ class SpeedRLKionClient:
                 and self._episode_started_s is not None
                 and time.monotonic() - self._episode_started_s >= self.episode_duration_s
             ):
-                self._finish_episode(success=False, reason="80-second timeout")
+                self._finish_episode(success=False, reason="episode timeout")
 
             target_left: np.ndarray | None = None
             target_right: np.ndarray | None = None
@@ -219,6 +248,22 @@ class SpeedRLKionClient:
                     )
                     target_left = np.asarray(action[LEFT_TARGET_KEY], dtype=np.float64)
                     target_right = np.asarray(action[RIGHT_TARGET_KEY], dtype=np.float64)
+                    if self.target_safety is not None:
+                        try:
+                            self.target_safety.validate(
+                                target_left,
+                                target_right,
+                                snapshot.left_pose,
+                                snapshot.right_pose,
+                            )
+                        except TargetSafetyError as exc:
+                            self._hardware_safety_error = str(exc)
+                            LOGGER.error("Hardware target safety abort: %s", exc)
+                            self._abort_episode(reason=f"target safety: {exc}")
+                            target_left = None
+                            target_right = None
+                            diagnostics["execution_state"] = "target_safety_abort"
+                            continue
                     self._last_target = {
                         "left": target_left.copy(),
                         "right": target_right.copy(),
@@ -353,6 +398,12 @@ class SpeedRLKionClient:
         if command == "abort":
             self._abort_episode()
             return self.status()
+        if command == "reset":
+            self._begin_reset()
+            return self.status()
+        if command == "ready":
+            self._confirm_reset_ready()
+            return self.status()
         if command == "approve":
             if len(parts) < 2:
                 raise ValueError("approve requires a tracking review note or report path")
@@ -370,8 +421,10 @@ class SpeedRLKionClient:
         raise ValueError(f"Unknown Speed-RL command {command!r}")
 
     def _start_episode(self) -> None:
-        if self.state == EpisodeState.RUNNING:
-            raise RuntimeError("An episode is already running")
+        if self.state != EpisodeState.IDLE:
+            raise RuntimeError(
+                f"Start requires IDLE state, got {self.state.value}; finish and reset first"
+            )
         if self._finalizer is not None and self._finalizer.is_alive():
             raise RuntimeError("The previous episode is still finalizing")
         if self._finalization_error is not None:
@@ -393,22 +446,35 @@ class SpeedRLKionClient:
             fixed_action = None
         if self.phase == "online":
             if not self.calibration.state.complete:
-                raise RuntimeError("All four manually approved calibration speeds are required")
+                raise RuntimeError("All configured calibration speeds require manual approval")
             stats = self.learner.stats()
             self._cache_learner_stats(stats)
             if not stats["online_training_ready"]:
-                raise RuntimeError("Online replay gate requires 256 transitions and 32 per speed")
+                raise RuntimeError("Online replay has not reached Rainbow learning_starts")
             if self._online_budget.remaining <= 0:
-                raise RuntimeError("The 22-episode online training budget is exhausted")
+                raise RuntimeError(
+                    f"The {self.online_episodes}-episode online training budget is exhausted"
+                )
         if self.phase == "greedy":
             if not self.calibration.state.complete:
                 raise RuntimeError("Greedy acceptance requires completed speed calibration")
             if self._online_budget.remaining != 0:
-                raise RuntimeError("Greedy acceptance requires all 22 online-training episodes")
+                raise RuntimeError(
+                    "Greedy acceptance requires all configured online-training episodes"
+                )
             if len(self._greedy_acceptance.outcomes) >= 5:
                 raise RuntimeError("The five-episode greedy acceptance run is complete")
-        if fixed_action is not None and fixed_action >= 2 and self._twist_stale:
-            raise RuntimeError("Cannot calibrate speed 1.3/1.6 while measured TCP twist is stale")
+        if (
+            fixed_action is not None
+            and fixed_action >= self.safety.stale_safe_action_count
+            and self._twist_stale
+        ):
+            raise RuntimeError("Cannot calibrate a masked speed while measured TCP twist is stale")
+        if not self.dry_run:
+            require_real_policy_cameras(
+                self.rospy,
+                (self.topics.left_camera, self.topics.right_camera, self.topics.head_camera),
+            )
 
         self._close_episode_resources()
         self.learner.install_actor_weights(self.actor)
@@ -416,7 +482,12 @@ class SpeedRLKionClient:
         self.agent.set_fixed_action(fixed_action)
         self.agent.set_greedy(self.phase == "greedy")
         self.safety.reset_episode()
-        initial_mask = (True, True, False, False) if self._twist_stale else (True,) * 4
+        if self._twist_stale:
+            initial_mask = (True,) * self.safety.stale_safe_action_count + (False,) * (
+                self.safety.action_count - self.safety.stale_safe_action_count
+            )
+        else:
+            initial_mask = (True,) * self.safety.action_count
         self.agent.set_action_mask(initial_mask)
 
         servo: KionDualArmServo | None = None
@@ -448,12 +519,14 @@ class SpeedRLKionClient:
                 {
                     "episode": next_episode,
                     "phase": self.phase,
+                    "execution_backend": self.execution_backend,
                     "inference_mode": self.agent.config.inference_mode,
                     "task": self.task,
                     "policy_version": self.actor.policy_version,
                     "fixed_action": fixed_action,
                     "control_frequency": self.control_frequency,
                     "speed_rl_contract": self.agent.feature_contract.to_dict(),
+                    "speed_values": self.agent.speed_values,
                     "topics": asdict(self.topics),
                 },
             )
@@ -475,6 +548,7 @@ class SpeedRLKionClient:
         self._last_target = None
         self._last_outcome = None
         self._last_safe_success = None
+        self._hardware_safety_error = None
         self._episode_started_s = time.monotonic()
         self.state = EpisodeState.RUNNING
         LOGGER.info(
@@ -484,6 +558,44 @@ class SpeedRLKionClient:
             fixed_action,
             self.actor.policy_version,
         )
+
+    def _begin_reset(self) -> None:
+        if self.state not in {
+            EpisodeState.TERMINATED,
+            EpisodeState.ABORTED,
+            EpisodeState.RESETTING,
+        }:
+            raise RuntimeError("Reset requires a finished or aborted episode")
+        if self._finalizer is not None and self._finalizer.is_alive():
+            raise RuntimeError("The episode is still finalizing; wait before reset")
+        if self._finalization_error is not None:
+            raise RuntimeError(f"Episode finalization failed: {self._finalization_error}")
+        self._close_episode_resources()
+        self.agent.reset_execution()
+        self._last_target = None
+        self._episode_started_s = None
+        self.reset_controller.begin()
+        self.state = EpisodeState.RESETTING
+        LOGGER.warning(
+            "Servo control released for reset (mode=%s). Confirm robot and scene reset, then "
+            "issue 'ready'.",
+            self.reset_controller.mode,
+        )
+
+    def _confirm_reset_ready(self) -> None:
+        if self.state != EpisodeState.RESETTING:
+            raise RuntimeError("Ready requires RESETTING state")
+        reset_status = self.reset_controller.status()
+        if not reset_status.operator_may_confirm_ready:
+            detail = reset_status.error or "dual-arm home request is still in progress"
+            raise RuntimeError(f"Reset cannot be confirmed ready: {detail}")
+        if self._critical_stale_fields:
+            raise RuntimeError(
+                "Cannot confirm reset while required observations are stale: "
+                + ", ".join(self._critical_stale_fields)
+            )
+        self.state = EpisodeState.IDLE
+        LOGGER.info("Operator confirmed robot and scene reset; the next episode may start")
 
     def _finish_episode(
         self,
@@ -519,7 +631,7 @@ class SpeedRLKionClient:
             reason=reason,
         )
 
-    def _abort_episode(self) -> None:
+    def _abort_episode(self, *, reason: str = "operator abort") -> None:
         if self.state != EpisodeState.RUNNING:
             raise RuntimeError("No RUNNING episode to abort")
         duration_s = time.monotonic() - float(self._episode_started_s)
@@ -553,7 +665,7 @@ class SpeedRLKionClient:
             transitions,
             decisions,
             recorder,
-            reason="operator abort",
+            reason=reason,
         )
 
     def _schedule_finalization(
@@ -588,6 +700,7 @@ class SpeedRLKionClient:
                 **asdict(outcome),
                 "episode": episode_number,
                 "phase": self.phase,
+                "execution_backend": self.execution_backend,
                 "inference_mode": self.agent.config.inference_mode,
                 "operator_reason": reason,
                 "safe_success": outcome.safe_success,
@@ -614,7 +727,7 @@ class SpeedRLKionClient:
                     if transitions:
                         self.learner.add_episode(transitions)
                         record["training"] = self.learner.train(
-                            min(2 * len(transitions), 256),
+                            len(transitions),
                             require_online_gate=True,
                         )
                         checkpoint_stats = self.learner.save(self.checkpoint_path)
@@ -625,7 +738,7 @@ class SpeedRLKionClient:
                         record["training"] = {"updates": 0, "mean_loss": None}
                         LOGGER.warning(
                             "Online episode=%d had no activated decision and did not consume "
-                            "the 22-episode budget",
+                            "the configured episode budget",
                             episode_number,
                         )
                 else:
@@ -675,12 +788,14 @@ class SpeedRLKionClient:
     def status(self) -> dict[str, Any]:
         diagnostics = self.agent.diagnostics()
         safety = self.safety.status()
+        reset_status = self.reset_controller.status()
         with self._learner_stats_lock:
             learner_stats = dict(self._learner_stats)
         activated_decisions = int(diagnostics.get("speed_rl_activated_decisions") or 0)
         return {
             "state": self.state.value,
-            "mode": "speed-rl",
+            "mode": ("speed-rl" if self.execution_backend == "toppra" else "speed-rl-baseline"),
+            "execution_backend": self.execution_backend,
             "inference_mode": self.agent.config.inference_mode,
             "task": self.task,
             "episode": self.episode_number,
@@ -711,6 +826,7 @@ class SpeedRLKionClient:
             "online_training_ready": learner_stats.get("online_training_ready"),
             "per_beta": learner_stats.get("beta"),
             "speed_violation": safety.violation_latched,
+            "hardware_safety_error": self._hardware_safety_error,
             "twist_stale": safety.twist_stale,
             "action_mask": safety.action_mask,
             "stale_fields": self._stale_fields,
@@ -725,6 +841,7 @@ class SpeedRLKionClient:
                 self._finalizer is not None and self._finalizer.is_alive()
             ),
             "finalization_error": self._finalization_error,
+            "reset": reset_status.to_dict(),
         }
 
     def _close_episode_resources(self) -> None:
@@ -753,6 +870,7 @@ class SpeedRLKionClient:
             if self._finalizer.is_alive():
                 raise RuntimeError("Timed out finalizing the last Speed-RL episode")
         self.agent.teardown()
+        self.reset_controller.wait(0.1)
         self.observations.close()
         self.state = EpisodeState.CLOSED
 
@@ -764,15 +882,40 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _positive_int(value: str) -> int:
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return result
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run independent Speed-RL over the bimanual GR00T TOPPRA rollout."
+        description="Run bimanual GR00T Speed-RL with TOPPRA or interpolation execution."
     )
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=47866)
     parser.add_argument("--timeout-ms", type=int, default=15_000)
     parser.add_argument("--policy-frequency", type=_positive_float, default=30.0)
     parser.add_argument("--control-frequency", type=_positive_float, default=250.0)
+    parser.add_argument(
+        "--execution-backend",
+        choices=("toppra", "interpolation"),
+        default="toppra",
+    )
+    parser.add_argument("--baseline-action-frequency", type=_positive_float, default=30.0)
+    parser.add_argument("--baseline-k-skip", type=_positive_int, default=10)
+    parser.add_argument("--baseline-speed-min", type=_positive_float, default=1.0)
+    parser.add_argument("--baseline-speed-max", type=_positive_float, default=4.0)
+    parser.add_argument("--baseline-speed-step", type=_positive_float, default=0.5)
+    parser.add_argument("--toppra-speed-min", type=_positive_float, default=0.7)
+    parser.add_argument("--toppra-speed-max", type=_positive_float, default=1.6)
+    parser.add_argument("--toppra-speed-step", type=_positive_float, default=0.3)
+    parser.add_argument("--policy-chunk-horizon", type=_positive_int, default=40)
+    parser.add_argument("--toppra-execution-horizon", type=_positive_int, default=30)
+    parser.add_argument("--rainbow-hidden-dim", type=_positive_int, default=256)
+    parser.add_argument("--rainbow-support-max", type=_positive_float)
+    parser.add_argument("--online-episodes", type=_positive_int, default=100)
     parser.add_argument("--inference-mode", choices=("sync", "async"), default="sync")
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--tts-samples", type=int, default=1)
@@ -799,8 +942,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--phase", choices=("calibration", "online", "greedy"), default="calibration"
     )
-    parser.add_argument("--state-root", type=Path, default=Path("logs/kion_speed_rl/state"))
-    parser.add_argument("--log-root", type=Path, default=Path("logs/kion_speed_rl/episodes"))
+    parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--log-root", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--async-verification", type=Path)
     parser.add_argument("--refill-threshold", type=int, default=20)
@@ -824,10 +967,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ros-namespace", default="/gr00t_rollout")
     parser.add_argument("--disable-pinch", action="store_true")
     parser.add_argument("--pinch-max-rate-hz", type=_positive_float, default=30.0)
+    parser.add_argument("--reset-mode", choices=("manual", "go-home"), default="manual")
+    parser.add_argument("--reset-service", default=DUAL_ARM_HOME_SERVICE)
+    parser.add_argument("--reset-timeout-s", type=_positive_float, default=10.0)
     parser.add_argument("--left-camera-topic", default=KionTopics.left_camera)
     parser.add_argument("--right-camera-topic", default=KionTopics.right_camera)
     parser.add_argument("--head-camera-topic", default=KionTopics.head_camera)
-    return parser.parse_args(argv)
+    parser.add_argument("--left-workspace-bounds")
+    parser.add_argument("--right-workspace-bounds")
+    parser.add_argument("--max-target-position-error-m", type=_positive_float)
+    parser.add_argument("--max-target-rotation-error-rad", type=_positive_float)
+    args = parser.parse_args(argv)
+    if args.execution_backend == "toppra":
+        args.state_root = args.state_root or Path("logs/kion_speed_rl/state")
+        args.log_root = args.log_root or Path("logs/kion_speed_rl/episodes")
+    else:
+        args.state_root = args.state_root or Path("logs/kion_speed_rl_baseline/state")
+        args.log_root = args.log_root or Path("logs/kion_speed_rl_baseline/episodes")
+    return args
+
+
+def _speed_values_from_args(args: argparse.Namespace) -> tuple[float, ...]:
+    if args.execution_backend == "toppra":
+        return speed_grid(args.toppra_speed_min, args.toppra_speed_max, args.toppra_speed_step)
+    return speed_grid(
+        args.baseline_speed_min,
+        args.baseline_speed_max,
+        args.baseline_speed_step,
+    )
 
 
 def _validate_runtime_args(args: argparse.Namespace) -> None:
@@ -840,6 +1007,30 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
             "Certified hardware limits must be supplied explicitly through "
             "--left-twist-thresholds and --right-twist-thresholds"
         )
+    target_guard_args = (
+        args.left_workspace_bounds,
+        args.right_workspace_bounds,
+        args.max_target_position_error_m,
+        args.max_target_rotation_error_rad,
+    )
+    if not args.dry_run and any(value is None for value in target_guard_args):
+        raise ValueError(
+            "Real motion requires explicit --left-workspace-bounds, "
+            "--right-workspace-bounds, --max-target-position-error-m, and "
+            "--max-target-rotation-error-rad"
+        )
+    if args.execution_backend == "interpolation":
+        if args.inference_mode != "sync":
+            raise ValueError("The interpolation Speed-RL baseline currently supports sync only")
+        if args.tts_samples != 1:
+            raise ValueError("The interpolation Speed-RL baseline requires --tts-samples 1")
+        if (args.baseline_k_skip - 1) * args.baseline_speed_max > (
+            args.policy_chunk_horizon - 1
+        ) + 1e-9:
+            raise ValueError("baseline k_skip and maximum speed exceed the configured policy chunk")
+    if args.toppra_execution_horizon > args.policy_chunk_horizon:
+        raise ValueError("TOPPRA execution horizon cannot exceed the policy chunk horizon")
+    _speed_values_from_args(args)
     if args.inference_mode == "async":
         if args.async_verification is None:
             raise ValueError(
@@ -906,8 +1097,32 @@ def main(argv: list[str] | None = None) -> None:
     )
     contract = _resolve_feature_contract(args)
     LOGGER.info("Discovered Speed-RL server contract: %s", contract.to_dict())
-    rainbow_config = RainbowConfig(feature_dim=contract.feature_dim)
+    speed_values = _speed_values_from_args(args)
+    theoretical_return_max = (
+        100.0 + 0.01 * args.policy_frequency * args.episode_duration_s * max(speed_values) ** 2
+    )
+    support_max = args.rainbow_support_max
+    if support_max is None:
+        support_max = 20.0 * math.ceil(theoretical_return_max / 20.0)
+    rainbow_config = RainbowConfig(
+        feature_dim=contract.feature_dim,
+        hidden_dim=args.rainbow_hidden_dim,
+        action_count=len(speed_values),
+        support_max=support_max,
+    )
     actor = SpeedActor(rainbow_config)
+    target_safety = None
+    if args.left_workspace_bounds is not None or args.right_workspace_bounds is not None:
+        if args.left_workspace_bounds is None or args.right_workspace_bounds is None:
+            raise ValueError("Both left and right workspace bounds must be supplied together")
+        if args.max_target_position_error_m is None or args.max_target_rotation_error_rad is None:
+            raise ValueError("Workspace bounds require both target tracking error limits")
+        target_safety = TargetSafetyGuard(
+            parse_workspace_bounds(args.left_workspace_bounds),
+            parse_workspace_bounds(args.right_workspace_bounds),
+            max_position_error_m=args.max_target_position_error_m,
+            max_rotation_error_rad=args.max_target_rotation_error_rad,
+        )
     checkpoint = args.checkpoint or args.state_root / "speed_rl.pt"
     if (args.inference_mode == "async" or args.phase == "greedy") and not checkpoint.exists():
         raise ValueError(
@@ -915,17 +1130,28 @@ def main(argv: list[str] | None = None) -> None:
         )
     ros_types = load_ros_types()
     ros_types.rospy.init_node(args.node_name, disable_signals=False)
-    learner = LearnerProcess(rainbow_config, contract)
+    restore_console_logging()
+    learner = LearnerProcess(
+        rainbow_config,
+        contract,
+        execution_backend=args.execution_backend,
+        speed_values=speed_values,
+    )
     agent: SpeedRLAgent | None = None
     client: SpeedRLKionClient | None = None
     try:
         if checkpoint.exists():
             learner.load(checkpoint)
         learner_stats = learner.stats()
-        calibration = CalibrationManager(args.state_root / "calibration.json")
+        calibration = CalibrationManager(
+            args.state_root / "calibration.json",
+            speed_values=speed_values,
+        )
         safety = SpeedViolationMonitor(
             parse_twist_thresholds(args.left_twist_thresholds),
             parse_twist_thresholds(args.right_twist_thresholds),
+            action_count=len(speed_values),
+            stale_safe_action_count=min(2, len(speed_values)),
         )
         limits = CartesianLimits(
             max_linear_velocity=(1.0,) * 3,
@@ -934,7 +1160,14 @@ def main(argv: list[str] | None = None) -> None:
             max_angular_acceleration=(15.0,) * 3,
             safety_margin=1.0,
         )
-        agent = SpeedRLAgent(
+        agent_class = (
+            SpeedRLAgent if args.execution_backend == "toppra" else InterpolationSpeedRLAgent
+        )
+        agent_kwargs: dict[str, Any] = {}
+        if args.execution_backend == "interpolation":
+            agent_kwargs["baseline_action_frequency"] = args.baseline_action_frequency
+            agent_kwargs["baseline_k_skip"] = args.baseline_k_skip
+        agent = agent_class(
             host=args.server_host,
             port=args.server_port,
             fps=args.policy_frequency,
@@ -959,6 +1192,10 @@ def main(argv: list[str] | None = None) -> None:
             speed_actor=actor,
             greedy=args.phase == "greedy",
             activated_decisions=learner_stats["activated_decisions"],
+            speed_values=speed_values,
+            policy_chunk_horizon=args.policy_chunk_horizon,
+            toppra_execution_horizon=args.toppra_execution_horizon,
+            **agent_kwargs,
         )
         client = SpeedRLKionClient(
             ros_types=ros_types,
@@ -982,11 +1219,16 @@ def main(argv: list[str] | None = None) -> None:
             max_image_age_s=args.max_image_age_s,
             task=args.task,
             dry_run=args.dry_run,
+            target_safety=target_safety,
             episode_duration_s=args.episode_duration_s,
             control_interface=args.control_interface,
             ros_namespace=args.ros_namespace,
             pinch_enabled=not args.disable_pinch,
             pinch_max_rate_hz=args.pinch_max_rate_hz,
+            online_episodes=args.online_episodes,
+            reset_mode=args.reset_mode,
+            reset_service=args.reset_service,
+            reset_timeout_s=args.reset_timeout_s,
         )
         client.run()
     finally:

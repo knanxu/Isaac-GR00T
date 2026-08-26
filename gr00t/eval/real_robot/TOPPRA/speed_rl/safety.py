@@ -26,7 +26,7 @@ class SpeedSafetyStatus:
     violation_latched: bool
     consecutive_counts: tuple[tuple[int, ...], tuple[int, ...]]
     twist_stale: bool
-    action_mask: tuple[bool, bool, bool, bool]
+    action_mask: tuple[bool, ...]
 
 
 class SpeedViolationMonitor:
@@ -38,6 +38,8 @@ class SpeedViolationMonitor:
         right_thresholds: Sequence[float],
         *,
         consecutive_frames: int = 100,
+        action_count: int = 4,
+        stale_safe_action_count: int = 2,
     ) -> None:
         self.thresholds = np.stack(
             (
@@ -48,6 +50,12 @@ class SpeedViolationMonitor:
         if consecutive_frames < 1:
             raise ValueError("consecutive_frames must be positive")
         self.consecutive_frames = int(consecutive_frames)
+        self.action_count = int(action_count)
+        self.stale_safe_action_count = int(stale_safe_action_count)
+        if self.action_count < 1:
+            raise ValueError("action_count must be positive")
+        if not 1 <= self.stale_safe_action_count <= self.action_count:
+            raise ValueError("stale_safe_action_count must lie inside the action space")
         self._counts = np.zeros((2, 6), dtype=np.int64)
         self._latched = False
         self._twist_stale = True
@@ -90,7 +98,12 @@ class SpeedViolationMonitor:
         return self.status()
 
     def status(self) -> SpeedSafetyStatus:
-        mask = (True, True, False, False) if self._twist_stale else (True, True, True, True)
+        if self._twist_stale:
+            mask = (True,) * self.stale_safe_action_count + (False,) * (
+                self.action_count - self.stale_safe_action_count
+            )
+        else:
+            mask = (True,) * self.action_count
         return SpeedSafetyStatus(
             violation_latched=self._latched,
             consecutive_counts=tuple(
