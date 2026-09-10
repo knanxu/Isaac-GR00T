@@ -117,3 +117,29 @@ nohup "$DRIFT_PY" "$DRIFT_REPO/scripts/training/train_drifting_wa1.py" \
 
 该目录保存完整基础权重、未合并的 adapters、动作头和 optimizer 状态。
 训练完成和 checkpoint 重载成功不等于实机任务成功，本次不执行 rollout 或 RL。
+
+## 已启动训练的 W&B 曲线
+
+`watch_drifting_wandb.py` 独立读取 `train.log`，补传历史并每 30 秒检查新指标。
+可以在上述训练运行中启动，不需要重启训练或改变原 FM/W&B 默认配置：
+
+```bash
+DRIFT_RUN="$DRIFT_RUNS/express_mix_n17_drifting_lora16_224_20260910"
+nohup "$DRIFT_PY" "$DRIFT_REPO/scripts/training/watch_drifting_wandb.py" \
+  --run-dir "$DRIFT_RUN" \
+  --entity knanxu-zhejiang-university --project finetune-gr00t-n1d7 \
+  > "$DRIFT_RUN/wandb_monitor.log" 2>&1 < /dev/null &
+```
+
+服务器需要已有 W&B 登录凭据。若系统 DNS 不可用，可额外传入
+`--resolve api.wandb.ai=<已核验的IP>` 和
+`--resolve storage.googleapis.com=<已核验的IP>`。
+这些地址只用于同步进程的临时 localhost HTTPS 代理；TLS 证书仍正常校验，
+系统 DNS、训练进程环境和原 FM 服务不受影响。应在启动时重新核验 IP。
+
+链接和同步进度写入 `wandb_monitor.json`；后台日志为 `wandb_monitor.log`。
+曲线横轴为 `train/global_step`，包括 `train/loss`、`train/grad_norm`、
+`train/learning_rate` 和 `eval/loss`。训练指标原本每 10 步记录，验证每 1000 步记录；
+补传的 wall-clock 时间是上传时间，应按训练步数查看历史。
+同步进程重启会接续同一 W&B run；重复启动由文件锁拒绝。
+它不上传模型/数据，也不将同步进程的 CPU/GPU 开销伪装成训练系统指标。
