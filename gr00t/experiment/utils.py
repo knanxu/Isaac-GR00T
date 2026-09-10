@@ -127,6 +127,8 @@ class BestMetricCheckpointCallback(TrainerCallback):
         *,
         greater_is_better: bool = True,
         exp_cfg_dir: Path | None = None,
+        processor_dir: Path | None = None,
+        checkpoint_prefix: str = "checkpoint",
     ):
         """
         Args:
@@ -140,6 +142,8 @@ class BestMetricCheckpointCallback(TrainerCallback):
         self.greater_is_better = greater_is_better
         self.best_metric = -float("inf") if greater_is_better else float("inf")
         self.exp_cfg_dir = exp_cfg_dir
+        self.processor_dir = processor_dir
+        self.checkpoint_prefix = checkpoint_prefix
         self._best_checkpoint_dir = None
         self._trainer = trainer
 
@@ -174,7 +178,7 @@ class BestMetricCheckpointCallback(TrainerCallback):
 
         best_checkpoint_dir = (
             Path(args.output_dir)
-            / f"checkpoint-{state.global_step}-best-{self.metric_name}_{metric_value}"
+            / f"{self.checkpoint_prefix}-{state.global_step}-best-{self.metric_name}_{metric_value}"
         )
 
         run_on_rank0(best_checkpoint_dir.mkdir, exist_ok=True, label="best_checkpoint.mkdir")
@@ -185,6 +189,8 @@ class BestMetricCheckpointCallback(TrainerCallback):
 
         with run_or_wait_on_rank0(label="best_checkpoint.copy") as is_rank0:
             if is_rank0:
+                if self.processor_dir is not None:
+                    shutil.copytree(self.processor_dir, best_checkpoint_dir, dirs_exist_ok=True)
                 if self.exp_cfg_dir is not None and self.exp_cfg_dir.exists():
                     exp_cfg_dst = best_checkpoint_dir / self.exp_cfg_dir.name
                     logger.info(

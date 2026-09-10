@@ -67,6 +67,7 @@ if __name__ == "__main__":
                         "dataset_paths": dataset_paths,
                         "mix_ratio": 1.0,
                         "embodiment_tag": embodiment_tag,
+                        "val_dataset_path": ft_config.validation_dataset_path,
                     }
                 ],
             }
@@ -83,6 +84,7 @@ if __name__ == "__main__":
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     config.model.use_percentiles = ft_config.use_percentiles
+    config.model.vlm_min_pixels = ft_config.vlm_min_pixels
     if (ft_config.shortest_image_edge is None) != (ft_config.crop_fraction is None):
         raise ValueError("shortest_image_edge and crop_fraction must be set together")
     if ft_config.shortest_image_edge is not None:
@@ -114,6 +116,12 @@ if __name__ == "__main__":
     config.training.num_gpus = ft_config.num_gpus
     config.training.use_wandb = ft_config.use_wandb
     config.training.max_steps = ft_config.max_steps
+    config.training.eval_strategy = "steps" if ft_config.validation_dataset_path else "no"
+    config.training.eval_steps = ft_config.eval_steps
+    config.training.eval_batch_size = ft_config.eval_batch_size
+    if ft_config.validation_dataset_path:
+        config.training.save_best_eval_metric_name = "eval_loss"
+        config.training.save_best_eval_metric_greater_is_better = False
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project

@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from pathlib import Path
+
 import numpy as np
 from tqdm import tqdm
 
 from gr00t.configs.base_config import Config
+from gr00t.data.dataset.fixed_validation_dataset import FixedValidationDataset
 from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
 from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -35,11 +39,22 @@ class DatasetFactory:
 
     def build(
         self, processor: BaseProcessor
-    ) -> tuple[ShardedMixtureDataset, ShardedMixtureDataset | None]:
+    ) -> tuple[ShardedMixtureDataset, FixedValidationDataset | None]:
         """Build the dataset. Returns a tuple of (train_dataset, eval_dataset)."""
-        assert self.config.training.eval_strategy == "no", (
-            "Sharded dataset does not support evaluation sets"
-        )
+        validation_specs = []
+        if self.config.training.eval_strategy != "no":
+            training_paths = {
+                Path(path).resolve()
+                for spec in self.config.data.datasets
+                for path in spec.dataset_paths
+            }
+            for spec in self.config.data.datasets:
+                if not spec.val_dataset_path:
+                    raise ValueError("Evaluation requires an explicit independent val_dataset_path")
+                for path in spec.val_dataset_path.split(os.pathsep):
+                    if Path(path).resolve() in training_paths:
+                        raise ValueError("Training and validation dataset paths overlap")
+                    validation_specs.append((path, spec.embodiment_tag))
 
         all_datasets = []
         all_weights = []
@@ -84,15 +99,18 @@ class DatasetFactory:
                 "this overrides per-dataset mix_ratio sampling weights."
             )
 
-        return (
-            ShardedMixtureDataset(
-                datasets=all_datasets,
-                weights=all_weights,
-                processor=processor,
-                seed=self.config.data.seed,
-                training=True,
-                num_shards_per_epoch=self.config.data.num_shards_per_epoch,
-                override_pretraining_statistics=self.config.data.override_pretraining_statistics,
-            ),
-            None,
+        training_dataset = ShardedMixtureDataset(
+            datasets=all_datasets,
+            weights=all_weights,
+            processor=processor,
+            seed=self.config.data.seed,
+            training=True,
+            num_shards_per_epoch=self.config.data.num_shards_per_epoch,
+            override_pretraining_statistics=self.config.data.override_pretraining_statistics,
         )
+        validation_dataset = (
+            FixedValidationDataset(validation_specs, self.config.data.modality_configs, processor)
+            if validation_specs
+            else None
+        )
+        return training_dataset, validation_dataset

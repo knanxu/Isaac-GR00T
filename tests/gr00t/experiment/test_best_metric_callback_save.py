@@ -183,6 +183,24 @@ def test_copies_exp_cfg_dir_on_save(tmp_path):
     assert copied.is_file(), "exp_cfg_dir should be copied into the best-checkpoint dir"
 
 
+def test_best_checkpoint_keeps_processor_outside_regular_rotation(tmp_path):
+    processor = tmp_path / "processor"
+    processor.mkdir()
+    for filename in ("processor_config.json", "statistics.json", "embodiment_id.json"):
+        (processor / filename).write_text('{"preserved": true}\n')
+    cb = BestMetricCheckpointCallback(
+        metric_name="eval_accuracy",
+        trainer=MagicMock(),
+        processor_dir=processor,
+        checkpoint_prefix="best-checkpoint",
+    )
+    _invoke(cb, tmp_path=tmp_path, metrics={"eval_accuracy": 0.5})
+    best = Path(cb._best_checkpoint_dir)
+    assert best not in list(tmp_path.glob("checkpoint-*"))
+    for file in processor.iterdir():
+        assert (best / file.name).read_bytes() == file.read_bytes()
+
+
 def test_no_copy_when_exp_cfg_dir_does_not_exist(tmp_path):
     """If exp_cfg_dir is configured but absent on disk, the save still
     proceeds and the missing directory is simply not copied — same

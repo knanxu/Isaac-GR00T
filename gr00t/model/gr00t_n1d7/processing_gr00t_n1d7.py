@@ -24,13 +24,14 @@ from typing import Any, Dict
 import warnings
 
 import albumentations as A
+from huggingface_hub import snapshot_download
 import numpy as np
 from PIL import Image
 import torch
 import torchvision.transforms.v2 as transforms
 from transformers import AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.utils import cached_file
+from transformers.utils import cached_file, is_offline_mode
 
 from gr00t.configs.data.embodiment_configs import ModalityConfig
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -72,7 +73,12 @@ _PROJECTOR_INDEX_GROUPS: dict[int, set[str]] = {
     2: {"libero_sim"},
     # Finetune placeholder projector; sim-eval robocasa tags piggyback on
     # `new_embodiment`.
-    10: {"new_embodiment", "robocasa_panda_omron", "robocasa_gr1_tabletop"},
+    10: {
+        "new_embodiment",
+        "naviai_wa1_head_lr_wf",
+        "robocasa_panda_omron",
+        "robocasa_gr1_tabletop",
+    },
     11: {"unitree_g1_sonic"},
     24: {"oxe_droid_relative_eef_relative_joint"},
     # Same G1 embodiment either side of the pretrain/posttrain boundary
@@ -120,13 +126,38 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX: dict[str, int] = _build_tag_to_projector_inde
 )
 
 
-def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3VLProcessor:
+def build_processor(
+    model_name: str, transformers_loading_kwargs: dict, vlm_min_pixels: int | None = None
+) -> Qwen3VLProcessor:
+    if vlm_min_pixels is not None and vlm_min_pixels <= 0:
+        raise ValueError("vlm_min_pixels must be positive")
     if Qwen3VLProcessor is None:
         raise ImportError(
             "Qwen3VLProcessor is not available. "
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
-    return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+    if (
+        is_offline_mode() or transformers_loading_kwargs.get("local_files_only", False)
+    ) and not Path(model_name).is_dir():
+        # Transformers 4.57.3's tokenizer regex check calls model_info for repo
+        # IDs even offline. A cached snapshot path keeps that check local.
+        model_name = snapshot_download(
+            model_name,
+            local_files_only=True,
+            **{
+                key: transformers_loading_kwargs[key]
+                for key in ("cache_dir", "revision", "token")
+                if key in transformers_loading_kwargs
+            },
+        )
+    processor = Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+    if vlm_min_pixels is not None:
+        # Qwen's fast image processor stores pixel bounds in its size dictionary.
+        processor.image_processor.size = {
+            **processor.image_processor.size,
+            "shortest_edge": vlm_min_pixels,
+        }
+    return processor
 
 
 def validate_action_horizons(modality_configs, max_action_horizon: int) -> None:
@@ -162,9 +193,10 @@ class Gr00tN1d7DataCollator:
         model_name: str,
         model_type: str = "qwen",
         transformers_loading_kwargs: dict = {},
+        vlm_min_pixels: int | None = None,
     ):
         ### We need to use the same processor for padding input ids and concat
-        self.processor = build_processor(model_name, transformers_loading_kwargs)
+        self.processor = build_processor(model_name, transformers_loading_kwargs, vlm_min_pixels)
         # Set padding side to 'left' for Flash Attention compatibility
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
@@ -224,6 +256,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         image_target_size: list[int] = None,
         shortest_image_edge: int = 256,
         crop_fraction: float = 0.95,
+        vlm_min_pixels: int | None = None,
         random_rotation_angle: int | None = None,
         color_jitter_params: dict[str, float] | None = None,
         formalize_language: bool = True,
@@ -286,7 +319,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.image_target_size = image_target_size
         self.random_rotation_angle = random_rotation_angle
         self.color_jitter_params = color_jitter_params
-        self.processor = build_processor(model_name, transformers_loading_kwargs)
+        self.vlm_min_pixels = vlm_min_pixels
+        self.processor = build_processor(model_name, transformers_loading_kwargs, vlm_min_pixels)
         # Set padding side to 'left' for Flash Attention compatibility
         self.processor.tokenizer.padding_side = "left"
         self.embodiment_id_mapping = embodiment_id_mapping or EMBODIMENT_TAG_TO_PROJECTOR_INDEX
@@ -327,6 +361,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_name=model_name,
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            vlm_min_pixels=vlm_min_pixels,
         )
         self.train()
 
@@ -773,6 +808,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "color_jitter_params": self.color_jitter_params,
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
+                "vlm_min_pixels": self.vlm_min_pixels,
                 "letter_box_transform": self.letter_box_transform,
                 # VLM settings
                 "model_name": self.model_name,
@@ -880,12 +916,48 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "vlm_min_pixels",
+                "use_percentiles",
+                "use_albumentations",
+                "formalize_language",
+                "apply_sincos_state_encoding",
+                "letter_box_transform",
+                "extra_augmentation_config",
             ]
             for key in override_keys:
                 if key in kwargs:
                     override = kwargs.pop(key)
                     if override is not None:
                         processor_kwargs[key] = override
+            # Image transforms are a group: switching resize modes must clear
+            # the checkpoint's legacy crop/target sizes, including explicit None.
+            fractional_override = any(
+                key in kwargs for key in ("shortest_image_edge", "crop_fraction")
+            )
+            legacy_override = any(key in kwargs for key in ("image_crop_size", "image_target_size"))
+            image_keys = (
+                "image_crop_size",
+                "image_target_size",
+                "shortest_image_edge",
+                "crop_fraction",
+            )
+            for key in image_keys:
+                if key in kwargs:
+                    processor_kwargs[key] = kwargs.pop(key)
+            if (
+                fractional_override
+                and processor_kwargs.get("shortest_image_edge") is not None
+                and processor_kwargs.get("crop_fraction") is not None
+            ):
+                processor_kwargs["image_crop_size"] = None
+                processor_kwargs["image_target_size"] = None
+            elif (
+                legacy_override
+                and processor_kwargs.get("image_crop_size") is not None
+                and processor_kwargs.get("image_target_size") is not None
+            ):
+                processor_kwargs["shortest_image_edge"] = None
+                processor_kwargs["crop_fraction"] = None
         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
 
 

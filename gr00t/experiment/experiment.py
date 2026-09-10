@@ -298,6 +298,7 @@ def run(config: Config):
         eval_strategy=config.training.eval_strategy,
         eval_steps=config.training.eval_steps,
         batch_eval_metrics=True,
+        prediction_loss_only=eval_dataset is not None,
         remove_unused_columns=config.training.remove_unused_columns,
         ignore_data_skip=True,
     )
@@ -311,6 +312,10 @@ def run(config: Config):
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
     )
+    if eval_dataset is not None:
+        # GR00T forward computes loss from nested inputs, with no top-level
+        # labels argument for Hugging Face to discover automatically.
+        trainer.can_return_loss = True
 
     trainer.add_callback(
         CheckpointFormatCallback(
@@ -326,6 +331,8 @@ def run(config: Config):
                 metric_name=config.training.save_best_eval_metric_name,
                 greater_is_better=config.training.save_best_eval_metric_greater_is_better,
                 exp_cfg_dir=save_cfg_dir,
+                processor_dir=processor_dir,
+                checkpoint_prefix="best-checkpoint",
                 trainer=trainer,
             )
         )

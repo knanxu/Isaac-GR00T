@@ -39,6 +39,15 @@ class FinetuneConfig:
     embodiment_tag: str
     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
+    validation_dataset_path: str | None = None
+    """Independent validation roots separated by os.pathsep; fixed windows from every episode."""
+
+    eval_steps: int = 1000
+    """Evaluate held-out windows every this many optimizer steps."""
+
+    eval_batch_size: int = 2
+    """Validation batch size per GPU."""
+
     modality_config_path: str | None = None
     """
     Path to a Python file defining the modality configuration for the given embodiment. 
@@ -100,6 +109,9 @@ class FinetuneConfig:
     If set, shortest_image_edge must also be set and legacy image_crop_size/image_target_size
     preprocessing is disabled.
     """
+
+    vlm_min_pixels: int | None = None
+    """VLM image processor's minimum pixel area; 50176 preserves 224x224 inputs."""
 
     extra_augmentation_config: str | None = None
     """

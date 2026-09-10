@@ -56,6 +56,7 @@ class Gr00tN1d7Config(PretrainedConfig):
 
     shortest_image_edge: int | None = None
     crop_fraction: float | None = None
+    vlm_min_pixels: int | None = None
 
     random_rotation_angle: int | None = None
     color_jitter_params: dict[str, float] | None = None

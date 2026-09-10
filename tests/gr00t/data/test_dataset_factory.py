@@ -116,11 +116,12 @@ class TestDatasetFactory:
         assert train_ds is not None
         assert eval_ds is None
 
-    def test_build_rejects_eval_strategy(self):
+    def test_build_requires_explicit_validation_path(self):
         from gr00t.data.dataset.factory import DatasetFactory
 
         config = _make_mock_config()
         config.training.eval_strategy = "steps"
+        config.data.datasets[0].val_dataset_path = None
         factory = DatasetFactory(config)
-        with pytest.raises(AssertionError, match="does not support evaluation"):
+        with pytest.raises(ValueError, match="explicit independent"):
             factory.build(MagicMock())
