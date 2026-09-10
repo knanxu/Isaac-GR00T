@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import select
+import signal
 import socket
 import threading
 import time
@@ -178,6 +179,11 @@ def main():
     # step, so train and eval records at the same optimizer step both survive.
     cursor = run.step
     print(f"W&B run: {run.url}; resuming at record {cursor}", flush=True)
+
+    def stop_monitor(*unused):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_monitor)
     try:
         while True:
             status = json.loads((root / "train_status.json").read_text())
@@ -185,7 +191,7 @@ def main():
             if cursor > len(records):
                 raise RuntimeError("Training log is shorter than the previously uploaded history")
             for index in range(cursor, len(records)):
-                run.log(records[index], step=index)
+                run.log(records[index], step=index, commit=True)
             cursor = len(records)
             state = status["state"]
             run.summary["training_state"] = state
