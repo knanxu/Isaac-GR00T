@@ -281,6 +281,10 @@ class Qwen3Backbone(torch.nn.Module):
                 self.model.language_model.eval()
             if self.model.visual and not self.tune_visual:
                 self.model.visual.eval()
+            # LoRA is installed only by the drifting path. Keep frozen base
+            # modules in eval mode while activating adapter dropout for training.
+            for dropout in getattr(self, "_drifting_lora_dropouts", ()):
+                dropout.train()
 
     def _reset_rotary_inv_freq(self) -> None:
         """Re-derive Qwen3-VL's non-persistent RoPE ``inv_freq`` buffers once at load.

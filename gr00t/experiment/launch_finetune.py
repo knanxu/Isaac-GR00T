@@ -76,8 +76,16 @@ if __name__ == "__main__":
     config.load_config_path = None
 
     # overwrite with finetune config supplied by the user
+    config.model.action_head_type = ft_config.action_head_type
+    config.model.drifting_gen_per_label = ft_config.drifting_gen_per_label
+    config.model.drifting_temperatures = ft_config.drifting_temperatures
+    config.model.drifting_per_timestep_loss = ft_config.drifting_per_timestep_loss
+    config.model.drifting_lora_rank = ft_config.drifting_lora_rank
+    config.model.drifting_lora_alpha = ft_config.drifting_lora_alpha
+    config.model.drifting_lora_dropout = ft_config.drifting_lora_dropout
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
+    config.model.validate_action_head()
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob

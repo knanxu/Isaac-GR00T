@@ -14,7 +14,8 @@
 # limitations under the License.
 
 # Finetune config used for single node post-training.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 import warnings
 
 
@@ -55,6 +56,27 @@ class FinetuneConfig:
     """
 
     # --- Model Tuning Flags ---
+    action_head_type: Literal["flow_matching", "drifting"] = "flow_matching"
+    """Training objective and inference mode. Old checkpoints default to flow matching."""
+
+    drifting_gen_per_label: int = 4
+    """Independent generated action chunks per observation during drifting training (>= 2)."""
+
+    drifting_temperatures: list[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+    """Positive kernel temperatures for drifting loss."""
+
+    drifting_per_timestep_loss: bool = True
+    """Compute drifting forces per timestep; False compares whole flattened action chunks."""
+
+    drifting_lora_rank: int = 0
+    """Enable LoRA on both Qwen vision and language attention/MLPs; 0 disables it. Drifting only."""
+
+    drifting_lora_alpha: float = 32.0
+    """LoRA scale numerator (effective scale is alpha/rank)."""
+
+    drifting_lora_dropout: float = 0.05
+    """Dropout on adapter inputs during training; frozen backbone modules remain in eval mode."""
+
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
 

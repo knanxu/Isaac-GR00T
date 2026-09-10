@@ -38,6 +38,36 @@ uv lock --locked
 - Config lives in `pyproject.toml` under `[tool.ruff]`
 - Run `pre-commit run --all-files` before committing
 
+## Drifting integration: preserve the existing flow matching workflow
+
+User requirement (2026-09-09): adding or extending the drifting action head must
+not change the existing flow matching (FM) training workflow. This is a hard
+compatibility constraint, including the user's FM policies trained in the cloud.
+
+- Existing FM commands must run as before without adding flags. FM stays the
+  default, including when an old checkpoint has no action-head selector.
+- Preserve FM losses, random sampling, trainable parameters, data processing,
+  optimizer/scheduler, precision, distributed settings, save/resume behavior,
+  checkpoint filenames/layout, weight keys/shapes, and serialized model/config
+  fields. Do not write inactive drifting/LoRA metadata into FM artifacts.
+- New drift/LoRA behavior must be explicitly enabled and scoped to that path.
+  Do not copy the reference fork's global DDP, resume, or LoRA changes into FM.
+- Never overwrite or convert the user's existing FM checkpoints. A drift run
+  uses its own output directory. FM weights may initialize a new drift run;
+  optimizer-state resume across objectives is a different operation and is rejected.
+- LoRA resumable checkpoints and merged deployment weights must be distinguished;
+  new drift artifacts do not justify changing the original FM artifact contract.
+- Verify FM compatibility against the pre-drifting implementation (numerical
+  behavior and serialized artifacts), alongside drift tests. CPU smoke tests
+  do not establish multi-GPU or real-robot readiness.
+- User-confirmed WA1 drift recipe (2026-09-10): official N1.7 base initialization;
+  vision/text backbone LoRA rank 16, alpha 32; full action-head training; G=4,
+  temperatures [0.02, 0.05, 0.2], per-timestep loss; four GPUs with microbatch 2
+  and accumulation 8 (effective batch 64); state dropout 0; 20,000 steps,
+  LR 1e-4, warmup 0.05, weight decay 1e-5. Reuse the recorded FM train/validation
+  splits and processing. Final push/cloud training commands require user review
+  before execution. This recipe does not change any FM defaults.
+
 ## Directory layout
 
 ```

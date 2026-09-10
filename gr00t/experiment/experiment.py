@@ -163,7 +163,7 @@ def save_run_config_artifacts(
     """Write ``config.yaml`` / ``conf.yaml`` / ``wandb_config.json``."""
     save_cfg_dir.mkdir(parents=True, exist_ok=True)
     config.save(save_cfg_dir / "config.yaml")
-    omegaconf_config = OmegaConf.create(config.__dict__)
+    omegaconf_config = OmegaConf.create(config.to_dict())
     omegaconf_config["max_steps"] = config.training.max_steps
     omegaconf_config["save_steps"] = config.training.save_steps
     OmegaConf.save(omegaconf_config, save_cfg_dir / "conf.yaml", resolve=True)
@@ -233,7 +233,7 @@ def run(config: Config):
         with run_or_wait_on_rank0(label="wandb.init") as is_rank0:
             if is_rank0:
                 config_dict = {
-                    **config.__dict__,
+                    **config.to_dict(),
                     "git_commit_hash": os.environ.get("GROOT_COMMIT_HASH", "unknown"),
                 }
 

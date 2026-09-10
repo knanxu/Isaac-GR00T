@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
@@ -79,8 +79,35 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            lora_kwargs = {}
+            if self.config.model.action_head_type == "drifting":
+                source_config = AutoConfig.from_pretrained(
+                    self.config.training.start_from_checkpoint, **self.transformers_loading_kwargs
+                )
+                source_rank = getattr(source_config, "drifting_lora_rank", 0)
+                if source_rank:
+                    for key in (
+                        "drifting_lora_rank",
+                        "drifting_lora_alpha",
+                        "drifting_lora_dropout",
+                    ):
+                        if getattr(source_config, key) != getattr(self.config.model, key):
+                            raise ValueError(
+                                f"LoRA checkpoint {key} differs from the requested configuration"
+                            )
+                # Load plain FM/base weights with their original key layout;
+                # adapters are initialized only after the strict weight check.
+                lora_kwargs = {
+                    "drifting_lora_rank": source_rank,
+                    "drifting_lora_alpha": self.config.model.drifting_lora_alpha,
+                    "drifting_lora_dropout": self.config.model.drifting_lora_dropout,
+                }
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
+                action_head_type=self.config.model.action_head_type,
+                drifting_gen_per_label=self.config.model.drifting_gen_per_label,
+                drifting_temperatures=self.config.model.drifting_temperatures,
+                drifting_per_timestep_loss=self.config.model.drifting_per_timestep_loss,
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
                 tune_projector=self.config.model.tune_projector,
@@ -91,6 +118,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
+                **lora_kwargs,
                 **self.transformers_loading_kwargs,
             )
 
@@ -118,6 +146,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
+
+            if self.config.model.drifting_lora_rank and not model.config.drifting_lora_rank:
+                from gr00t.model.modules.drifting_lora import apply_drifting_lora
+
+                model.config.drifting_lora_rank = self.config.model.drifting_lora_rank
+                apply_drifting_lora(model.backbone, model.config)
 
         else:
             model = self.model_class(

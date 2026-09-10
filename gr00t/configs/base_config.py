@@ -87,6 +87,13 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
+    def to_dict(self) -> dict:
+        """Serialize a run without adding inactive action-head fields to FM artifacts."""
+        config = asdict(self)
+        if isinstance(self.model, Gr00tN1d7Config):
+            config["model"] = self.model.to_filtered_dict(exclude_augment=False)
+        return config
+
     def save(self, path: Path):
         """Save the config as plain key/value YAML (no Python-object tags).
 
@@ -101,7 +108,7 @@ class Config:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, "w") as f:
-            yaml.safe_dump(_build_safe_tree(asdict(self)), f, sort_keys=False)
+            yaml.safe_dump(_build_safe_tree(self.to_dict()), f, sort_keys=False)
 
     def load(self, path: Path):
         """Load config from a plain key/value YAML file into ``self``.

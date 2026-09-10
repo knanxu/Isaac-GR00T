@@ -29,6 +29,7 @@ pipeline is bottlenecked by data loading or by the model's computation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -239,6 +240,29 @@ class Gr00tTrainer(Trainer):
             latest_checkpoint = resume_from_checkpoint  # caller passed an explicit path
 
         if latest_checkpoint is not None:
+            model_config = getattr(self.model, "config", None)
+            if getattr(model_config, "model_type", None) == "Gr00tN1d7":
+                with open(os.path.join(latest_checkpoint, "config.json")) as f:
+                    saved_config = json.load(f)
+                saved_head = saved_config.get("action_head_type", "flow_matching")
+                if saved_head != model_config.action_head_type:
+                    raise ValueError(
+                        f"Cannot resume {saved_head} checkpoint with "
+                        f"action_head_type={model_config.action_head_type}. "
+                        "To change objectives, use --base-model-path to initialize weights, "
+                        "a new --output-dir, and omit --resume-from-checkpoint."
+                    )
+                if saved_head == "drifting":
+                    for key in (
+                        "drifting_lora_rank",
+                        "drifting_lora_alpha",
+                        "drifting_lora_dropout",
+                    ):
+                        default = getattr(type(model_config), key)
+                        if saved_config.get(key, default) != getattr(model_config, key):
+                            raise ValueError(
+                                f"Cannot resume with a different {key}; use the checkpoint's LoRA configuration"
+                            )
             logging.info(f"Resuming from checkpoint {latest_checkpoint}")
             # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
             self.state = TrainerState.load_from_json(

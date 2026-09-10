@@ -16,7 +16,9 @@
 from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
 from enum import Enum
 import json
+import math
 from pathlib import Path
+from typing import Literal
 
 import torch
 from transformers import PretrainedConfig
@@ -104,11 +106,21 @@ class Gr00tN1d7Config(PretrainedConfig):
     )
 
     # Flow matching parameters
+    action_head_type: Literal["flow_matching", "drifting"] = "flow_matching"
     num_inference_timesteps: int = 4
     noise_beta_alpha: float = 1.5
     noise_beta_beta: float = 1.0
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
+
+    # Drifting uses the same parameters, with a direct action prediction at t=0.
+    drifting_gen_per_label: int = 4
+    drifting_temperatures: list[float] = field(default_factory=lambda: [0.02, 0.05, 0.2])
+    drifting_per_timestep_loss: bool = True
+    # Opt-in LoRA on Qwen vision/text attention and MLP projections, never the action head.
+    drifting_lora_rank: int = 0
+    drifting_lora_alpha: float = 32.0
+    drifting_lora_dropout: float = 0.05
 
     # Training parameters
     tune_projector: bool = True
@@ -138,6 +150,46 @@ class Gr00tN1d7Config(PretrainedConfig):
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
 
+        self.validate_action_head()
+
+    def validate_action_head(self):
+        if self.action_head_type not in ("flow_matching", "drifting"):
+            raise ValueError(f"Unknown action_head_type: {self.action_head_type!r}")
+        if self.action_head_type != "drifting" and self.drifting_lora_rank:
+            raise ValueError("LoRA is supported only with action_head_type=drifting")
+        if self.action_head_type == "drifting":
+            if not isinstance(self.drifting_gen_per_label, int) or self.drifting_gen_per_label < 2:
+                raise ValueError("drifting_gen_per_label must be an integer >= 2")
+            if not self.drifting_temperatures or any(
+                not math.isfinite(t) or t <= 0 for t in self.drifting_temperatures
+            ):
+                raise ValueError("drifting_temperatures must contain finite positive values")
+            if type(self.drifting_lora_rank) is not int or self.drifting_lora_rank < 0:
+                raise ValueError("drifting_lora_rank must be an integer >= 0")
+            if not math.isfinite(self.drifting_lora_alpha) or self.drifting_lora_alpha <= 0:
+                raise ValueError("drifting_lora_alpha must be finite and positive")
+            if not 0 <= self.drifting_lora_dropout < 1:
+                raise ValueError("drifting_lora_dropout must be in [0, 1)")
+            if self.drifting_lora_rank and (
+                self.tune_llm or self.tune_visual or self.tune_top_llm_layers
+            ):
+                raise ValueError(
+                    "Drifting LoRA requires frozen backbone base weights; disable full backbone tuning"
+                )
+
+    def _filter_inactive_action_head_fields(self, config: dict) -> dict:
+        if self.action_head_type == "flow_matching":
+            return {
+                key: value
+                for key, value in config.items()
+                if key != "action_head_type" and not key.startswith("drifting_")
+            }
+        return config
+
+    def to_dict(self) -> dict:
+        # Keep legacy FM checkpoint configs free of fields added for drifting.
+        return self._filter_inactive_action_head_fields(super().to_dict())
+
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""
         if is_dataclass(self):
@@ -158,7 +210,7 @@ class Gr00tN1d7Config(PretrainedConfig):
             }
             cfg = {k: v for k, v in cfg.items() if k not in exclude_keys}
 
-        return cfg
+        return self._filter_inactive_action_head_fields(cfg)
 
     def to_filtered_json(self, exclude_augment: bool = True, **kwargs) -> str:
         """Return a JSON string of this config, optionally excluding augmentation keys."""

@@ -26,6 +26,7 @@ import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
+from gr00t.model.modules.drifting_loss import drifting_loss
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
@@ -36,12 +37,13 @@ logger = logging.getLogger(__name__)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
-    """Action head component for flow matching diffusion policy."""
+    """Shared action network with flow matching or single-step drifting semantics."""
 
     supports_gradient_checkpointing = True
 
     def __init__(self, config: Gr00tN1d7Config):
         super().__init__()
+        config.validate_action_head()
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
@@ -227,6 +229,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action
+        if self.config.action_head_type == "drifting":
+            return self._forward_drifting(backbone_output, action_input, state_features)
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -282,6 +286,93 @@ class Gr00tN1d7ActionHead(nn.Module):
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
+            "state_features": state_features,
+        }
+
+    def _predict_drifting(
+        self,
+        noise,
+        state_features,
+        vl_embeds,
+        embodiment_id,
+        backbone_output,
+    ):
+        """Predict actions directly at t=0, without changing any parameter names."""
+        timesteps = torch.zeros(noise.shape[0], device=noise.device, dtype=torch.long)
+        action_features = self.action_encoder(noise, timesteps, embodiment_id)
+        if self.config.add_pos_embed:
+            positions = torch.arange(noise.shape[1], device=noise.device)
+            action_features = action_features + self.position_embedding(positions).unsqueeze(0)
+        kwargs = {}
+        if self.config.use_alternate_vl_dit:
+            kwargs = {
+                "image_mask": backbone_output.image_mask.bool(),
+                "backbone_attention_mask": backbone_output.backbone_attention_mask.bool(),
+            }
+        output = self.model(
+            hidden_states=torch.cat((state_features, action_features), dim=1),
+            encoder_hidden_states=vl_embeds,
+            encoder_attention_mask=backbone_output.backbone_attention_mask.bool(),
+            timestep=timesteps,
+            return_all_hidden_states=False,
+            **kwargs,
+        )
+        actions = self.action_decoder(output, embodiment_id)[:, -noise.shape[1] :]
+        return actions
+
+    def _forward_drifting(self, backbone_output, action_input, state_features):
+        actions = action_input.action
+        mask = action_input.action_mask
+        batch_size, horizon, action_dim = actions.shape
+        num_generated = self.config.drifting_gen_per_label
+        repeated_backbone = BatchFeature(
+            data={
+                key: value.repeat_interleave(num_generated, dim=0)
+                for key, value in backbone_output.items()
+                if key in ("backbone_features", "backbone_attention_mask", "image_mask")
+            }
+        )
+        noise = torch.randn(
+            batch_size * num_generated,
+            horizon,
+            action_dim,
+            device=actions.device,
+            dtype=actions.dtype,
+        )
+        predictions = self._predict_drifting(
+            noise,
+            state_features.repeat_interleave(num_generated, dim=0),
+            repeated_backbone.backbone_features,
+            action_input.embodiment_id.repeat_interleave(num_generated, dim=0),
+            repeated_backbone,
+        )
+        predictions = predictions.reshape(batch_size, num_generated, horizon, action_dim)
+        if self.config.drifting_per_timestep_loss:
+            action_loss = torch.stack(
+                [
+                    drifting_loss(
+                        predictions[:, :, t],
+                        actions[:, None, t],
+                        mask[:, t],
+                        self.config.drifting_temperatures,
+                    )
+                    for t in range(horizon)
+                ],
+                dim=1,
+            )
+        else:
+            action_loss = drifting_loss(
+                predictions.flatten(2),
+                actions.reshape(batch_size, 1, -1),
+                mask.reshape(batch_size, -1),
+                self.config.drifting_temperatures,
+            ).reshape_as(actions)
+        loss = action_loss.sum() / (mask.float().sum() + 1e-6)
+        return {
+            "loss": loss,
+            "action_loss": action_loss,
+            "action_mask": mask,
+            "backbone_features": backbone_output.backbone_features,
             "state_features": state_features,
         }
 
@@ -351,6 +442,23 @@ class Gr00tN1d7ActionHead(nn.Module):
             dtype=vl_embeds.dtype,
             device=device,
         )
+
+        if self.config.action_head_type == "drifting":
+            if "action" in action_input:
+                raise ValueError(
+                    "Drifting does not support flow-matching RTC inpainting. "
+                    "Disable RTC and omit previous actions from the input."
+                )
+            actions = self._predict_drifting(
+                actions, state_features, vl_embeds, embodiment_id, backbone_output
+            )
+            return BatchFeature(
+                data={
+                    "action_pred": actions,
+                    "backbone_features": vl_embeds,
+                    "state_features": state_features,
+                }
+            )
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
@@ -542,6 +650,10 @@ class Gr00tN1d7(PreTrainedModel):
 
         # Initialize action head
         self.action_head = Gr00tN1d7ActionHead(config)
+        if config.drifting_lora_rank:
+            from gr00t.model.modules.drifting_lora import apply_drifting_lora
+
+            apply_drifting_lora(self.backbone, config)
         from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
         self.collator = Gr00tN1d7DataCollator(
