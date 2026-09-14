@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Reload the unmerged drift checkpoint and repeat the prior FM observation probes."""
+"""Reload a drift training checkpoint and repeat the prior FM observation probes."""
 
 import argparse
 import json
@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--reference-reload", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--device", default="cuda:3")
+    parser.add_argument("--recipe", choices=["lora16", "full-fm-scope"], default="lora16")
     args = parser.parse_args()
     reference = json.loads(args.reference_reload.read_text())
     policy = Gr00tPolicy("naviai_wa1_head_lr_wf", str(args.checkpoint), device=args.device)
@@ -32,11 +33,21 @@ def main():
         action_horizon=40,
         state_dropout_prob=0.0,
     )
+    if args.recipe == "full-fm-scope":
+        expected.update(
+            drifting_lora_rank=0,
+            drifting_lora_dropout=0.0,
+            tune_visual=True,
+            tune_llm=False,
+            tune_projector=True,
+            tune_diffusion_model=True,
+        )
     for key, value in expected.items():
         if getattr(config, key) != value:
             raise RuntimeError(f"Reloaded {key} differs from the confirmed recipe")
-    if not any("lora_A" in name for name in policy.model.state_dict()):
-        raise RuntimeError("Checkpoint has no unmerged LoRA weights")
+    has_lora = any(".lora_" in name for name in policy.model.state_dict())
+    if has_lora != (args.recipe == "lora16"):
+        raise RuntimeError("Checkpoint LoRA weights differ from the selected recipe")
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     grid = policy.processor.processor.image_processor(images=[image], return_tensors="pt")[
         "image_grid_thw"
@@ -87,6 +98,8 @@ def main():
         )
     report = {
         "checkpoint": str(args.checkpoint),
+        "recipe": args.recipe,
+        "has_lora_weights": has_lora,
         "image_grid_thw": grid,
         "robots": results,
         "purpose": "Checkpoint reload and finite single-step actions; not robot task success",

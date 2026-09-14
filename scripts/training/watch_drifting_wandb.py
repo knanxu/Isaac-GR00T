@@ -155,7 +155,14 @@ def main():
         dir=str(directory),
         mode="online",
         job_type="drifting-training",
-        tags=["drifting", "lora16", "wa1", "log-monitor"],
+        tags=[
+            "drifting",
+            f"lora{option('--drifting-lora-rank')}"
+            if int(option("--drifting-lora-rank"))
+            else "no-lora",
+            "wa1",
+            "log-monitor",
+        ],
         config={
             "training_git_commit": metadata["git_commit"],
             "logging_source": "existing Trainer stdout; independent monitoring process",
@@ -164,6 +171,10 @@ def main():
             "learning_rate": float(option("--learning-rate")),
             "global_batch_size": int(option("--global-batch-size")),
             "gradient_accumulation_steps": int(option("--gradient-accumulation-steps")),
+            "effective_batch_size": int(option("--global-batch-size"))
+            * int(option("--gradient-accumulation-steps")),
+            "tune_visual": "--tune-visual" in argv,
+            "tune_llm": "--tune-llm" in argv,
             "drifting_lora_rank": int(option("--drifting-lora-rank")),
             "drifting_lora_alpha": float(option("--drifting-lora-alpha")),
             "drifting_gen_per_label": int(option("--drifting-gen-per-label")),

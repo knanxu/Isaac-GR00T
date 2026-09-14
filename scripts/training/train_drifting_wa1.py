@@ -42,6 +42,17 @@ RECIPE = {
     "--no-resume-from-checkpoint": [],
     "--save-total-limit": ["3"],
 }
+RECIPES = {
+    "lora16": RECIPE,
+    "full-fm-scope": {
+        **{key: value for key, value in RECIPE.items() if key != "--no-tune-visual"},
+        "--drifting-lora-rank": ["0"],
+        "--drifting-lora-dropout": ["0"],
+        "--global-batch-size": ["64"],
+        "--gradient-accumulation-steps": ["1"],
+        "--tune-visual": [],
+    },
+}
 
 
 def _options(argv):
@@ -57,7 +68,8 @@ def _options(argv):
     return result
 
 
-def build_command(reference, run_dir, phase):
+def build_command(reference, run_dir, phase, recipe="lora16"):
+    selected_recipe = RECIPES[recipe]
     argv = reference["argv"]
     entry = "gr00t/experiment/launch_finetune.py"
     index = argv.index(entry)
@@ -76,10 +88,10 @@ def build_command(reference, run_dir, phase):
     for protected in (old_output.parent, base):
         if run_dir.is_relative_to(protected) or protected.is_relative_to(run_dir):
             raise ValueError("Drifting output must be separate from the FM run and base weights")
-    for flag in RECIPE:
+    for flag in selected_recipe:
         opposite = "--" + flag[5:] if flag.startswith("--no-") else "--no-" + flag[2:]
         options.pop(opposite, None)
-    options.update(RECIPE)
+    options.update(selected_recipe)
     options["--output-dir"] = [str(run_dir / "train")]
     options["--max-steps"] = ["20" if phase == "smoke" else "20000"]
     options["--save-steps"] = ["10" if phase == "smoke" else "1000"]
@@ -96,12 +108,13 @@ def main():
     parser.add_argument("--fm-command", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=["smoke", "train"], required=True)
+    parser.add_argument("--recipe", choices=RECIPES, default="lora16")
     parser.add_argument("--smoke-run", type=Path, help="Required for executing the full run")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     reference = json.loads(args.fm_command.read_text())
     run_dir = args.run_dir.resolve()
-    command = build_command(reference, run_dir, args.phase)
+    command = build_command(reference, run_dir, args.phase, args.recipe)
     print(shlex.join(command), flush=True)
     if not args.execute:
         return
@@ -121,6 +134,9 @@ def main():
             raise ValueError("The four-GPU smoke run has not passed checkpoint verification")
         if smoke_command["git_commit"] != commit or smoke_command["source_sha256"] != source_hash:
             raise ValueError("Smoke verification must use the same code and FM data command")
+        expected_smoke = build_command(reference, args.smoke_run.resolve(), "smoke", args.recipe)
+        if smoke_command["argv"] != expected_smoke:
+            raise ValueError("Smoke verification must use the same recipe and training arguments")
 
     options = _options(command[command.index("gr00t/experiment/launch_finetune.py") + 1 :])
     for key in ("--base-model-path", "--dataset-path", "--validation-dataset-path"):
@@ -152,6 +168,7 @@ def main():
         "source_sha256": source_hash,
         "base_revision": reference.get("base_revision"),
         "git_commit": commit,
+        "recipe": args.recipe,
         "environment": {
             k: environment[k]
             for k in (
@@ -211,6 +228,8 @@ def main():
                     str(run_dir / "train_reload.json"),
                     "--device",
                     "cuda:3",
+                    "--recipe",
+                    args.recipe,
                 ],
                 cwd=REPO,
                 env=environment,

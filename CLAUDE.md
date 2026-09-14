@@ -67,6 +67,13 @@ compatibility constraint, including the user's FM policies trained in the cloud.
   LR 1e-4, warmup 0.05, weight decay 1e-5. Reuse the recorded FM train/validation
   splits and processing. Final push/cloud training commands require user review
   before execution. This recipe does not change any FM defaults.
+- User-confirmed follow-up (2026-09-14): no LoRA, no gradient accumulation
+  (steps=1), directly tune vision and the action head, freeze the LLM, and reuse
+  the FM data. The separate `full-fm-scope` recipe prepares this run without
+  changing the previous recipe. The user also confirmed matching the FM batch:
+  global batch 64, four GPUs with microbatch 16 and accumulation 1. The proposed
+  run uses 20,000 steps. Review final launch commands before push/launch; the
+  full recipe must pass its own smoke test without silently reducing batch.
 
 ## Directory layout
 
