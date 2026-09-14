@@ -50,6 +50,9 @@ RECIPES = {
         "--drifting-lora-dropout": ["0"],
         "--global-batch-size": ["64"],
         "--gradient-accumulation-steps": ["1"],
+        # Regular checkpoints keep only the latest resumable state. The existing
+        # best-metric callback independently retains one best model directory.
+        "--save-total-limit": ["1"],
         "--tune-visual": [],
     },
 }

@@ -74,6 +74,10 @@ compatibility constraint, including the user's FM policies trained in the cloud.
   global batch 64, four GPUs with microbatch 16 and accumulation 1. The proposed
   run uses 20,000 steps. Review final launch commands before push/launch; the
   full recipe must pass its own smoke test without silently reducing batch.
+- User-confirmed retention for the new drift run (2026-09-14): retain one
+  best-eval-loss model and one latest resumable checkpoint. Set regular
+  `save_total_limit=1`; the existing best-checkpoint callback manages the best
+  model separately. Do not change FM defaults or prune existing FM artifacts.
 
 ## Directory layout
 

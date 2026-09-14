@@ -123,6 +123,7 @@ def test_full_fm_scope_has_no_adapters_or_accumulation_and_preserves_inputs(phas
         "--drifting-lora-dropout",
         "--global-batch-size",
         "--gradient-accumulation-steps",
+        "--save-total-limit",
         "--no-tune-visual",
         "--tune-visual",
     }
@@ -131,6 +132,8 @@ def test_full_fm_scope_has_no_adapters_or_accumulation_and_preserves_inputs(phas
     previous = _options(reference["argv"][entry + 1 :])
     assert actual["--global-batch-size"] == previous["--global-batch-size"] == ["64"]
     assert int(actual["--global-batch-size"][0]) // int(actual["--num-gpus"][0]) == 16
+    assert actual["--save-total-limit"] == ["1"]
+    assert "--no-save-only-model" in actual
     assert "--tune-visual" in actual
     assert "--no-tune-llm" in actual
     assert "--tune-llm" not in actual
@@ -206,4 +209,5 @@ def test_full_weight_dry_run_does_not_create_directory(tmp_path, monkeypatch, ca
     assert "--drifting-lora-rank 0" in command
     assert "--gradient-accumulation-steps 1" in command
     assert "--global-batch-size 64" in command
+    assert "--save-total-limit 1" in command
     assert not run.exists()

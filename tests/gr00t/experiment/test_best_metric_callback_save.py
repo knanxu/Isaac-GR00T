@@ -201,6 +201,46 @@ def test_best_checkpoint_keeps_processor_outside_regular_rotation(tmp_path):
         assert (best / file.name).read_bytes() == file.read_bytes()
 
 
+def test_latest_only_rotation_keeps_independent_best_and_last_optimizer(tmp_path):
+    """Exercise the real HF rotation and GR00T best callback across three saves."""
+    from transformers import Trainer, TrainingArguments
+    from transformers.trainer_callback import TrainerControl, TrainerState
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = TrainingArguments(
+        output_dir=str(tmp_path), save_total_limit=1, use_cpu=True, report_to="none"
+    )
+    trainer.state = TrainerState()
+    trainer.save_model = MagicMock()
+    callback = BestMetricCheckpointCallback(
+        metric_name="eval_loss",
+        greater_is_better=False,
+        trainer=trainer,
+        checkpoint_prefix="best-checkpoint",
+    )
+    for step, loss in ((10, 0.5), (20, 0.2), (30, 0.4)):
+        trainer.state.global_step = step
+        checkpoint = tmp_path / f"checkpoint-{step}"
+        checkpoint.mkdir()
+        (checkpoint / "optimizer.pt").write_bytes(f"optimizer at {step}".encode())
+        trainer.state.save_to_json(str(checkpoint / "trainer_state.json"))
+        callback.on_evaluate(
+            trainer.args,
+            trainer.state,
+            TrainerControl(),
+            metrics={"eval_loss": loss},
+            model=None,
+        )
+        trainer._rotate_checkpoints(output_dir=str(tmp_path))
+
+    assert {p.name for p in tmp_path.iterdir() if p.is_dir()} == {
+        "best-checkpoint-20-best-eval_loss_0.2",
+        "checkpoint-30",
+    }
+    assert (tmp_path / "checkpoint-30/optimizer.pt").read_bytes() == b"optimizer at 30"
+    assert (tmp_path / "checkpoint-30/trainer_state.json").is_file()
+
+
 def test_no_copy_when_exp_cfg_dir_does_not_exist(tmp_path):
     """If exp_cfg_dir is configured but absent on disk, the save still
     proceeds and the missing directory is simply not copied — same
