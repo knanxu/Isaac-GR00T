@@ -42,7 +42,11 @@ import subprocess
 import sys
 from unittest.mock import MagicMock
 
-from gr00t.experiment.utils import BestMetricCheckpointCallback, _broadcast_save_decision
+from gr00t.experiment.utils import (
+    BestMetricCheckpointCallback,
+    _broadcast_save_decision,
+    save_final_model,
+)
 import pytest
 import torch
 import torch.distributed as dist
@@ -249,6 +253,34 @@ def test_no_copy_when_exp_cfg_dir_does_not_exist(tmp_path):
     _invoke(cb, tmp_path=tmp_path, metrics={"eval_accuracy": 0.5})
     trainer.save_model.assert_called_once()
     assert not (tmp_path / "checkpoint-100-best-eval_accuracy_0.5" / "missing").exists()
+
+
+def test_default_final_export_keeps_original_trainer_save_call(tmp_path):
+    trainer = MagicMock()
+    assert save_final_model(trainer, tmp_path) == tmp_path
+    trainer.save_model.assert_called_once_with()
+
+
+def test_explicit_reuse_does_not_export_or_modify_final_checkpoint(tmp_path):
+    trainer = MagicMock()
+    trainer.state.global_step = 20
+    checkpoint = tmp_path / "checkpoint-20"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text('{"global_step": 20}')
+    (checkpoint / "optimizer.pt").write_bytes(b"keep resumable state")
+    before = {p.name: p.read_bytes() for p in checkpoint.iterdir()}
+    assert save_final_model(trainer, tmp_path, reuse_last_checkpoint=True) == checkpoint
+    trainer.save_model.assert_not_called()
+    assert {p.name: p.read_bytes() for p in checkpoint.iterdir()} == before
+    assert list(tmp_path.iterdir()) == [checkpoint]
+
+
+def test_explicit_reuse_rejects_missing_final_state(tmp_path):
+    trainer = MagicMock()
+    trainer.state.global_step = 20
+    with pytest.raises(RuntimeError, match="Cannot reuse missing final checkpoint"):
+        save_final_model(trainer, tmp_path, reuse_last_checkpoint=True)
+    trainer.save_model.assert_not_called()
 
 
 def test_previous_best_dir_is_replaced_on_each_improvement(tmp_path):

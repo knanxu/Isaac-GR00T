@@ -21,8 +21,8 @@
 完整续训 checkpoint（含 optimizer / Trainer 状态）；既有 best 回调独立保留验证
 `eval_loss` 最低的 `best-checkpoint-*`，用于推理。最优指验证 loss，不代表已验证实机成功率。
 短测和正式训练都采用此设置；新保存完成后才清理前一份，因此保存期间有临时空间峰值。
-训练根目录仍遵循既有流程保存 final model 导出，它与最后 checkpoint 同一步，约额外
-6.4 GiB；这里不更改全局保存流程或原 FM checkpoint 格式。
+此 drift 配置训练结束时直接使用最后 checkpoint，不再在根目录重复导出同一步权重。
+只有显式 drifting 且 `save_total_limit=1` 才启用；FM 仍执行原来的根目录 final model 保存。
 
 上一版每卡 2、累积 8，有效 batch=64；本版每卡 16、累积 1，有效 batch 仍为 64。
 因此相同步数的样本处理量保持一致。此次还冻结了此前通过 LoRA 更新的 LLM，

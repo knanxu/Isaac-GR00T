@@ -32,7 +32,11 @@ from gr00t.configs.training.training_config import check_resume_compatibility
 
 # Use custom trainer that profiles data loading & forward times
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
-from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
+from gr00t.experiment.utils import (
+    BestMetricCheckpointCallback,
+    CheckpointFormatCallback,
+    save_final_model,
+)
 from gr00t.model import MODEL_REGISTRY
 from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, save_initial_actions
@@ -374,8 +378,14 @@ def run(config: Config):
         trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
     # Save final model
-    trainer.save_model()
-    logging.info(f"Model saved to {output_dir}")
+    final_model_dir = save_final_model(
+        trainer,
+        output_dir,
+        reuse_last_checkpoint=(
+            config.model.action_head_type == "drifting" and config.training.save_total_limit == 1
+        ),
+    )
+    logging.info(f"Model saved to {final_model_dir}")
 
     if config.training.assert_loss_less_than is not None:
         final_loss = trainer.loss

@@ -29,6 +29,22 @@ from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
 logger = logging.getLogger(__name__)
 
 
+def save_final_model(trainer, output_dir: Path, *, reuse_last_checkpoint: bool = False):
+    """Avoid an extra root export only when the caller explicitly requests it."""
+    if not reuse_last_checkpoint:
+        trainer.save_model()
+        return output_dir
+
+    checkpoint = output_dir / f"checkpoint-{trainer.state.global_step}"
+
+    def verify_last_checkpoint():
+        if not (checkpoint / "trainer_state.json").is_file():
+            raise RuntimeError(f"Cannot reuse missing final checkpoint: {checkpoint}")
+
+    run_on_rank0(verify_last_checkpoint, label="verify_final_checkpoint")
+    return checkpoint
+
+
 def _broadcast_save_decision(save_flag: int, metric_value: float) -> tuple[int, float]:
     """Broadcast rank-0's `(save_flag, metric_value)` decision to every rank.
 

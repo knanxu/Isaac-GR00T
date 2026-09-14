@@ -78,6 +78,9 @@ compatibility constraint, including the user's FM policies trained in the cloud.
   best-eval-loss model and one latest resumable checkpoint. Set regular
   `save_total_limit=1`; the existing best-checkpoint callback manages the best
   model separately. Do not change FM defaults or prune existing FM artifacts.
+  Explicit drift runs with `save_total_limit=1` reuse the saved last checkpoint
+  instead of exporting duplicate final weights at the training root. FM keeps
+  its original final export; the last drift checkpoint retains optimizer state.
 
 ## Directory layout
 
