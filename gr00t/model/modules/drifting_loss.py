@@ -11,6 +11,23 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.no_grad()
+def action_mse_statistics(
+    prediction: torch.Tensor, expert: torch.Tensor, action_mask: torch.Tensor
+) -> torch.Tensor:
+    """Per-example normalized-action MSE and validity, for logging only.
+
+    Inputs are [B, H, D], with one predicted chunk per observation. Average
+    valid coordinates within each chunk; the trainer averages valid examples.
+    Fully padded examples contribute neither an error nor an example count.
+    """
+    mask = action_mask.bool()
+    error = torch.where(mask, prediction.float() - expert.float(), 0.0)
+    counts = mask.flatten(1).sum(dim=-1)
+    mse = error.square().flatten(1).sum(dim=-1) / counts.clamp_min(1)
+    return torch.stack((mse, (counts > 0).to(mse.dtype)), dim=-1)
+
+
 def drifting_loss(
     generated: torch.Tensor,
     positive: torch.Tensor,

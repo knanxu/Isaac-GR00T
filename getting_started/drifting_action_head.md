@@ -4,6 +4,16 @@
 显式传入 `--action-head-type drifting`，动作网络在 t=0 单次前向直接预测完整 action chunk。
 “单步”不改变 action horizon，也不跳过视觉语言 backbone。
 
+## 独立 action MSE 日志
+
+Drift 训练额外记录 `action_mse` 和 `eval_action_mse`；独立 W&B monitor 对应显示
+`train/action_mse` 和 `eval/action_mse`。每条观测只取当前前向已有的第一段预测 action
+chunk，与对应专家 chunk 在归一化动作空间计算 MSE：先对该样本的有效坐标求均值，
+再对有效样本求 batch 平均，排除 padding 和全 padding 样本。不额外采样，也不对 G 个
+生成样本计算均值或分布统计。训练日志汇总当前 logging interval，验证日志汇总完整验证集，
+正确处理最后一个不足 batch 的批次。这两个指标均停止梯度，不加入 drifting 训练 loss。
+原 loss、随机数采样、优化梯度及 checkpoint 选择指标不变；FM 保持原 trainer 和日志。
+
 ## FM 兼容约定
 
 - FM 保持默认；旧训练命令不增加参数。缺少动作头类型的旧 checkpoint 继续按 FM 加载。

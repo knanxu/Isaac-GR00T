@@ -26,9 +26,11 @@ import time
 
 METRICS = {
     "loss": "train/loss",
+    "action_mse": "train/action_mse",
     "grad_norm": "train/grad_norm",
     "learning_rate": "train/learning_rate",
     "eval_loss": "eval/loss",
+    "eval_action_mse": "eval/action_mse",
     "eval_runtime": "eval/runtime",
     "eval_samples_per_second": "eval/samples_per_second",
     "eval_steps_per_second": "eval/steps_per_second",

@@ -308,7 +308,12 @@ def run(config: Config):
     )
 
     # Create trainer
-    trainer = Gr00tTrainer(
+    trainer_class = Gr00tTrainer
+    if config.model.action_head_type == "drifting":
+        from gr00t.experiment.drifting_trainer import DriftingTrainer
+
+        trainer_class = DriftingTrainer
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

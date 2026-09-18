@@ -26,7 +26,7 @@ import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
-from gr00t.model.modules.drifting_loss import drifting_loss
+from gr00t.model.modules.drifting_loss import action_mse_statistics, drifting_loss
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
@@ -370,6 +370,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         loss = action_loss.sum() / (mask.float().sum() + 1e-6)
         return {
             "loss": loss,
+            # One existing prediction per observation; no extra sampling and
+            # no averaging across the G samples used by the drifting objective.
+            "action_mse_statistics": action_mse_statistics(predictions[:, 0], actions, mask),
             "action_loss": action_loss,
             "action_mask": mask,
             "backbone_features": backbone_output.backbone_features,
